@@ -25,7 +25,7 @@ Main features:
 - **Track + Line selectors**: *Track* picks the indicator (the first Keltner by default, locked until **Toggle track** is checked, which opens it to any indicator); *Line* picks the plot to follow (Midline by default, or Upper / Lower).
 - **Own quantity**: a Qty box with ▲▼ arrows, set to 1 by default and independent of Chart Trader's *Order qty*.
 - **Attached orders**: with *Track line* on, working orders are re-priced each time the line (plus offset) moves.
-- **KC order list**: every order with its label (`Ord-…`) and **F** (filled) / **NF** (not filled) status.
+- **KC order lists**: three exclusive lists. An order moves from **NF** (not filled) to **F** (filled, still open) to completed (**F-W-**points or **L-**points, 4 ticks = 1 point). It is never shown in two lists at once.
 - **ATM-aware**: changing the ATM strategy cancels and re-submits unfilled (NF) entries with the new template, and re-prices the stop/target of the filled (F) orders you check.
 - **Cancel KC Orders**: cancels only the orders this tool placed.
 - **Appears only when relevant**: the section is shown only while a visible indicator with *"Keltner"* in its name is on the chart.
@@ -126,7 +126,15 @@ The order type depends on which side of the market the order price (line ± offs
 
 **Offset:** the buy price is `line + n ticks`, the sell price is `line − n ticks` (rounded to the tick). *Max ticks offset* (default 100) only trims a typed value in the Offset box; it is never added to the line.
 
-**Order list:** each order gets a label like `Ord-af3658-Nov-10-26_09-31-02-114-BUY-1-F`. `F` = fully filled, `NF` = not filled. Filled rows get a checkbox: checked orders have their ATM stop/target re-priced when you change the ATM strategy.
+**Order lists:** each order appears in one of three lists.
+
+| List | Example | When |
+|---|---|---|
+| Not filled | `Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-NF` | Working, including a partial fill |
+| Filled | `Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-F` | Entry fully filled and the trade still open. The checkbox is only on this list: checked orders have their ATM stop/target re-priced when you change the ATM strategy |
+| Completed | `Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-F-W-5.25` or `…-BUY-1-L-4.75` | The filled quantity is closed. **W** is a win, **L** is a loss, and the last number is points (4 ticks = 1 point). A flat close is `F-W-0` |
+
+A cancel that never filled is removed and does not appear in any list.
 
 </details>
 
@@ -262,7 +270,7 @@ Planning to add to this project:
 - :heavy_check_mark: Orders attached to (tracking) the midband
 - :heavy_check_mark: Offset in ticks from the line, with a drawn zone
 - :heavy_check_mark: Selectable line (Midline / Upper / Lower) and any-indicator tracking (Toggle track)
-- :heavy_check_mark: KC order list with F / NF status and ATM-change handling
+- :heavy_check_mark: Three KC order lists (NF, F, completed W/L in points) and ATM-change handling
 - :heavy_check_mark: Selector for which Keltner indicator to track
 - :heavy_check_mark: Bilingual manuals (EN / ES)
 - :x: Right-click chart menu shortcuts (Buy / Sell LMT @ Mid)

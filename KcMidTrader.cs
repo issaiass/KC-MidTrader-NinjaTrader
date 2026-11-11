@@ -82,8 +82,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             public NinjaTrader.NinjaScript.AtmStrategy AtmTemplate;
             public string       AtmName;          // template name captured at submit; selector objects are reused
             public bool         FollowAtm;        // unfilled (NF) entry is re-submitted when the ATM selector changes
-            public string       Label;            // Ord-xxxxxx-MMM-dd-yy_HH-mm-ss-fff (checkbox key; list text adds side, qty, F/NF)
+            public string       Label;            // Ord-xxxxxx-MMM-dd-yy_HH-mm-ss-fff (checkbox key; list text adds side, qty, F/NF or W/L)
             public bool         Track;
+            public bool         Completed;        // entry is done and the filled quantity has been closed
+            public double       Points;           // closed result, 4 ticks = 1 point; negative is a loss
             public bool         PendingReplace;   // cancel sent, waiting to re-submit
             public bool         SwapAtm;          // re-submit uses ReplaceAtmName (empty = no ATM)
             public string       ReplaceAtmName;
@@ -137,11 +139,15 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool                                      trackPickerOn;  // false = Track stays on the Keltner (or the last choice)
         private System.Windows.Controls.TextBox           offsetBox;
         private System.Windows.Controls.Button            offsetMinusButton, offsetPlusButton;
+        private System.Windows.Controls.Grid              offsetRow;      // offset label + spinner; hidden when Show zone is off
         private System.Windows.Controls.CheckBox          showZoneBox;
         private System.Windows.Controls.ComboBox          kcCombo;        // which Keltner Channel to track
         private System.Windows.Controls.ComboBox          lineCombo;      // which plot of that channel
-        private System.Windows.Controls.ScrollViewer      orderListHost;
-        private System.Windows.Controls.StackPanel        orderListPanel;
+        private System.Windows.Controls.Grid              kcRow;          // Track label + selector
+        private System.Windows.Controls.Grid              lineRow;        // Line label + selector
+        private System.Windows.Controls.StackPanel        nfListPanel;
+        private System.Windows.Controls.StackPanel        filledListPanel;
+        private System.Windows.Controls.StackPanel        doneListPanel;
         private List<KcSource> kcList = new List<KcSource>();
         private List<int>      linePlots = new List<int>();
         private volatile KcSource selectedKc;
@@ -903,7 +909,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             panel.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition());
             panel.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition());
             // 0 header, 1 track, 2 line, 3 qty, 4 offset, 5 show zone, 6 track line,
-            // 7 toggle track, 8 buy/sell, 9 cancel, 10 status, 11 order list (last in the group).
+            // 7 toggle track, 8 buy/sell, 9 cancel, 10 status, 11 the three order lists (last in the group).
             for (int i = 0; i < 12; i++)
                 panel.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
 
@@ -922,7 +928,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             Place(header, 0, 0, 1); Place(midText, 0, 1, 1);
 
             // Row 1: which Keltner Channel to track (defaults to the first one listed on the chart)
-            System.Windows.Controls.Grid kcRow = new System.Windows.Controls.Grid { Margin = new Thickness(1, 1, 1, 3) };
+            kcRow = new System.Windows.Controls.Grid { Margin = new Thickness(1, 1, 1, 3) };
             kcRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
             kcRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             System.Windows.Controls.TextBlock kcLabel = new System.Windows.Controls.TextBlock
@@ -943,7 +949,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             Place(kcRow, 1, 0, 2);
 
             // Row 2: which plot to follow. Midline is the default.
-            System.Windows.Controls.Grid lineRow = new System.Windows.Controls.Grid { Margin = new Thickness(1, 1, 1, 3) };
+            lineRow = new System.Windows.Controls.Grid { Margin = new Thickness(1, 1, 1, 3) };
             lineRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
             lineRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             System.Windows.Controls.TextBlock lineLabel = new System.Windows.Controls.TextBlock
@@ -1027,8 +1033,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             qtyRow.Children.Add(qtyLabel); qtyRow.Children.Add(qtyElement);
             Place(qtyRow, 3, 0, 2);
 
-            // Row 3: ticks offset. The number is the zone width; MaxTicksOffset only trims a typed value above the ceiling.
-            System.Windows.Controls.Grid offsetRow = new System.Windows.Controls.Grid();
+            // Row 4: ticks offset. The number is the zone width; MaxTicksOffset only trims a typed value above the ceiling.
+            offsetRow = new System.Windows.Controls.Grid();
             offsetRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
             offsetRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             System.Windows.Controls.TextBlock offsetLabel = new System.Windows.Controls.TextBlock
@@ -1079,7 +1085,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 Content = "Track line", IsChecked = TrackByDefault, Foreground = fg,
                 VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 1, 1, 1),
-                ToolTip = "Keep KC orders attached to the offset price as the selected line moves"
+                ToolTip = "Show or hide Track and Line. Orders keep following the selected line either way."
             };
             toggleTrackBox = new System.Windows.Controls.CheckBox
             {
@@ -1112,19 +1118,19 @@ namespace NinjaTrader.NinjaScript.Indicators
             Place(statusText, 10, 0, 2);
 
             // Last in the group. Light fill so sell red (#A32424) stays readable.
-            orderListPanel = new System.Windows.Controls.StackPanel();
-            orderListHost = new System.Windows.Controls.ScrollViewer
-            {
-                Content = orderListPanel,
-                MinHeight = 36,
-                MaxHeight = 110,
-                VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Disabled,
-                Background = Brushes.White
-            };
+            // Three exclusive lists: working (NF), open fills (F), closed trades (W / L plus points).
+            nfListPanel = new System.Windows.Controls.StackPanel();
+            filledListPanel = new System.Windows.Controls.StackPanel();
+            doneListPanel = new System.Windows.Controls.StackPanel();
+            System.Windows.Controls.StackPanel orderLists = new System.Windows.Controls.StackPanel();
+            orderLists.Children.Add(MakeOrderSection("Not filled", "Working orders that are not filled.", nfListPanel));
+            orderLists.Children.Add(MakeOrderDivider());
+            orderLists.Children.Add(MakeOrderSection("Filled", "Filled orders still open. Check one to include it when the ATM strategy changes.", filledListPanel));
+            orderLists.Children.Add(MakeOrderDivider());
+            orderLists.Children.Add(MakeOrderSection("Completed", "Closed trades. W is a win and L is a loss. The last number is points (4 ticks = 1 point).", doneListPanel));
             System.Windows.Controls.Border orderListBorder = new System.Windows.Controls.Border
             {
-                Child = orderListHost,
+                Child = orderLists,
                 MinHeight = 40,
                 Margin = new Thickness(2, 2, 2, 2),
                 BorderThickness = new Thickness(1),
@@ -1132,6 +1138,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Background = Brushes.White
             };
             Place(orderListBorder, 11, 0, 2);
+            ApplyOptionVisibility();
 
             buyButton.Click    += OnBuyClick;
             sellButton.Click   += OnSellClick;
@@ -1147,6 +1154,40 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             HookAtmSelector();
             RefreshOrderList();
+        }
+
+        private static UIElement MakeOrderSection(string title, string tip, System.Windows.Controls.StackPanel rows)
+        {
+            System.Windows.Controls.StackPanel section = new System.Windows.Controls.StackPanel();
+            section.Children.Add(new System.Windows.Controls.TextBlock
+            {
+                Text = title,
+                FontSize = 10,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                Margin = new Thickness(4, 3, 4, 0),
+                ToolTip = tip
+            });
+            section.Children.Add(new System.Windows.Controls.ScrollViewer
+            {
+                Content = rows,
+                MinHeight = 18,
+                MaxHeight = 72,
+                VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Disabled,
+                Background = Brushes.White
+            });
+            return section;
+        }
+
+        private static UIElement MakeOrderDivider()
+        {
+            return new System.Windows.Controls.Border
+            {
+                Height = 1,
+                Margin = new Thickness(4, 1, 4, 1),
+                Background = new SolidColorBrush(Color.FromRgb(0xC5, 0xCB, 0xD3))
+            };
         }
 
         private System.Windows.Controls.Button MakeButton(string text, Style style, Color bg)
@@ -1347,7 +1388,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             NinjaTrader.NinjaScript.AtmStrategy atm = UseChartTraderAtm ? SelectedAtm() : null;
             int  qty   = ReadQty();
-            bool track = trackBox.IsChecked == true;
+            bool track = trackAll;
             bool isBuy = action == OrderAction.Buy;
 
             SetStatusNow(Submit(acct, action, qty, OffsetPrice(isBuy, mid), atm, track, null, UseChartTraderAtm, null));
@@ -1366,9 +1407,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void OnTrackClick(object sender, RoutedEventArgs e)
         {
-            trackAll = trackBox.IsChecked == true;
-            lock (sync) foreach (TrackedOrder t in tracked) t.Track = trackAll;
-            SetStatusNow(trackAll ? "Tracking ON for KC orders." : "Tracking OFF - orders stay at their price.");
+            ApplyOptionVisibility();
         }
 
         // Unlocks the Track list. The current indicator keeps being followed either way.
@@ -1417,7 +1456,20 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void OnShowZoneClick(object sender, RoutedEventArgs e)
         {
             showZone = showZoneBox != null && showZoneBox.IsChecked == true;
+            ApplyOptionVisibility();
             if (ChartControl != null) ChartControl.InvalidateVisual();
+        }
+
+        // Show zone hides the offset controls. Track line hides Track and Line. Both keep working while hidden.
+        private void ApplyOptionVisibility()
+        {
+            if (offsetRow != null)
+                offsetRow.Visibility = showZone ? Visibility.Visible : Visibility.Collapsed;
+            bool showTrack = trackBox != null && trackBox.IsChecked == true;
+            if (kcRow != null)
+                kcRow.Visibility = showTrack ? Visibility.Visible : Visibility.Collapsed;
+            if (lineRow != null)
+                lineRow.Visibility = showTrack ? Visibility.Visible : Visibility.Collapsed;
         }
 
         // Applies on Enter, focus loss, spin, or wheel. A value above the ceiling is trimmed; it does not widen the zone.
@@ -1626,12 +1678,39 @@ namespace NinjaTrader.NinjaScript.Indicators
             return qty > 0 && t.Order.Filled >= qty;
         }
 
-        // Ord-af3658-Oct-10-26_18-35-17-560-BUY-4-F
+        // Filled list: the entry is fully filled, or a partial fill whose remainder was cancelled.
+        // A working partial stays NF.
+        private static bool IsListedFilled(TrackedOrder t)
+        {
+            if (t == null || t.Order == null || t.Order.Filled <= 0 || t.Completed) return false;
+            if (IsEntryFullyFilled(t)) return true;
+            return Order.IsTerminalState(t.Order.OrderState);
+        }
+
+        // Not filled:  Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-NF
+        // Filled:     Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-F
+        // Won:        Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-F-W-5.25
+        // Lost:       Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-L-4.75
+        // Points are price difference / tick size / 4. A flat close is F-W-0.
         private static string OrderListText(TrackedOrder t)
         {
             string side = IsBuyAction(t.Action) ? "BUY" : "SELL";
-            string fill = IsEntryFullyFilled(t) ? "F" : "NF";
-            return (t.Label ?? "") + "-" + side + "-" + t.Quantity + "-" + fill;
+            string tail;
+            if (t.Completed)
+            {
+                string pts = FormatPoints(t.Points);
+                tail = t.Points < 0 ? ("L-" + pts) : ("F-W-" + pts);
+            }
+            else
+                tail = IsListedFilled(t) ? "F" : "NF";
+            return (t.Label ?? "") + "-" + side + "-" + t.Quantity + "-" + tail;
+        }
+
+        private static string FormatPoints(double points)
+        {
+            double abs = Math.Abs(points);
+            if (abs == 0) return "0";
+            return abs.ToString("0.##", CultureInfo.InvariantCulture);
         }
 
         private static void NoteFill(TrackedOrder t)
@@ -1668,6 +1747,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 hookedAccounts.Add(acct);
             }
             acct.OrderUpdate += OnAccountOrderUpdate;
+            acct.ExecutionUpdate += OnAccountExecution;
         }
 
         private void UnhookAccounts()
@@ -1682,7 +1762,17 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 try { acct.OrderUpdate -= OnAccountOrderUpdate; }
                 catch { }
+                try { acct.ExecutionUpdate -= OnAccountExecution; }
+                catch { }
             }
+        }
+
+        private void OnAccountExecution(object sender, ExecutionEventArgs e)
+        {
+            if (e == null || e.Execution == null) return;
+            Execution ex = e.Execution;
+            if (ex.Instrument == null || Instrument == null || ex.Instrument.FullName != Instrument.FullName) return;
+            SyncOrderList();
         }
 
         private void OnAccountOrderUpdate(object sender, OrderEventArgs e)
@@ -1977,7 +2067,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         t.FollowAtm = true;
                         toCancel.Add(t);
                     }
-                    else if (t.Order.Filled > 0 && t.SelectedForAtm && !same)
+                    else if (t.Order.Filled > 0 && t.SelectedForAtm && !t.Completed && !same)
                         toReprice.Add(t);
                 }
             }
@@ -2213,10 +2303,187 @@ namespace NinjaTrader.NinjaScript.Indicators
             public bool   IsBuy;
             public bool   Checkable;
             public bool   Checked;
+            public bool   Completed;
+            public bool   Won;
+        }
+
+        // One open order while its exit quantity and price are being matched.
+        private sealed class ExitScan
+        {
+            public TrackedOrder Track;
+            public int Need;
+            public int Got;
+            public double Notional;
+            public bool EntryDone;
+            public DateTime Since;
+            public bool IsBuy;
+            public NinjaTrader.NinjaScript.StrategyBase Owner;
+            public List<Order> PricedChildren;
+            public List<Order> AllChildren;
+            public double EntryPx;
+        }
+
+        // Marks a tracked order complete once its filled quantity is closed.
+        // Exit price comes from linked ATM stops/targets, then same-strategy exits, then a Close/Exit order.
+        // Each exit quantity is given to only one order.
+        private void SettleOutcomes()
+        {
+            List<ExitScan> scans = new List<ExitScan>();
+            lock (sync)
+            {
+                foreach (TrackedOrder t in tracked)
+                {
+                    if (t.Completed || t.Order == null || t.Order.Filled <= 0) continue;
+                    ExitScan s = new ExitScan();
+                    s.Track = t;
+                    s.Need = t.Order.Filled;
+                    s.EntryDone = IsEntryFullyFilled(t) || Order.IsTerminalState(t.Order.OrderState);
+                    s.Since = t.Order.Time;
+                    s.IsBuy = IsBuyAction(t.Action);
+                    s.Owner = t.AtmOwner;
+                    s.EntryPx = t.FillPrice > 0 ? t.FillPrice : t.Order.AverageFillPrice;
+                    s.AllChildren = new List<Order>();
+                    s.AllChildren.AddRange(t.StopOrders);
+                    s.AllChildren.AddRange(t.TargetOrders);
+                    s.PricedChildren = new List<Order>();
+                    foreach (Order c in s.AllChildren)
+                    {
+                        if (c == null || c.Filled <= 0 || c.AverageFillPrice <= 0) continue;
+                        s.Got += c.Filled;
+                        s.Notional += c.AverageFillPrice * c.Filled;
+                        s.PricedChildren.Add(c);
+                    }
+                    scans.Add(s);
+                }
+            }
+            if (scans.Count == 0) return;
+
+            scans.Sort(delegate (ExitScan a, ExitScan b) { return a.Since.CompareTo(b.Since); });
+
+            Dictionary<Account, List<ExitScan>> byAccount = new Dictionary<Account, List<ExitScan>>();
+            foreach (ExitScan s in scans)
+            {
+                if (s.Track.Account == null) continue;
+                List<ExitScan> list;
+                if (!byAccount.TryGetValue(s.Track.Account, out list))
+                {
+                    list = new List<ExitScan>();
+                    byAccount[s.Track.Account] = list;
+                }
+                list.Add(s);
+            }
+
+            foreach (KeyValuePair<Account, List<ExitScan>> pair in byAccount)
+            {
+                Execution[] execs;
+                try
+                {
+                    lock (pair.Key.Executions) execs = pair.Key.Executions.ToArray();
+                }
+                catch { continue; }
+
+                Array.Sort(execs, delegate (Execution a, Execution b) { return a.Time.CompareTo(b.Time); });
+                foreach (Execution ex in execs)
+                    AssignExit(pair.Value, ex);
+            }
+
+            double tick = 0;
+            try { tick = TickSize; }
+            catch { tick = 0; }
+            if (tick <= 0 && Instrument != null && Instrument.MasterInstrument != null)
+                tick = Instrument.MasterInstrument.TickSize;
+            if (tick <= 0) return;
+
+            lock (sync)
+            {
+                foreach (ExitScan s in scans)
+                {
+                    if (s.Track.Completed) continue;
+                    if (!s.EntryDone || s.Got < s.Need || s.Need <= 0 || s.EntryPx <= 0) continue;
+                    double got = s.Got;
+                    double notional = s.Notional;
+                    if (got > s.Need)
+                    {
+                        notional = notional * s.Need / got;
+                        got = s.Need;
+                    }
+                    if (got <= 0) continue;
+                    double exitPx = notional / got;
+                    double diff = s.IsBuy ? (exitPx - s.EntryPx) : (s.EntryPx - exitPx);
+                    double points = Math.Round(diff / tick / 4.0, 2, MidpointRounding.AwayFromZero);
+                    if (points == 0) points = 0;
+                    s.Track.Completed = true;
+                    s.Track.Points = points;
+                }
+            }
+        }
+
+        private void AssignExit(List<ExitScan> scans, Execution ex)
+        {
+            if (ex == null || ex.Quantity <= 0 || ex.Price <= 0) return;
+            if (ex.Instrument == null || Instrument == null || ex.Instrument.FullName != Instrument.FullName) return;
+
+            int left = ex.Quantity;
+            for (int i = 0; i < scans.Count && left > 0; i++)
+            {
+                ExitScan s = scans[i];
+                if (!s.EntryDone || s.Got >= s.Need) continue;
+                if (ex.Time < s.Since) continue;
+                if (s.Track.Order != null && ex.Order == s.Track.Order) continue;
+                if (ContainsOrder(s.PricedChildren, ex.Order)) continue;
+
+                bool ownChild = ContainsOrder(s.AllChildren, ex.Order);
+                if (!ownChild && !BelongsToScan(s, ex)) continue;
+                if (IsSellExecution(ex) != s.IsBuy) continue;
+
+                int room = s.Need - s.Got;
+                int take = left < room ? left : room;
+                s.Got += take;
+                s.Notional += ex.Price * take;
+                left -= take;
+            }
+        }
+
+        private static bool ContainsOrder(List<Order> orders, Order o)
+        {
+            if (o == null || orders == null) return false;
+            for (int i = 0; i < orders.Count; i++)
+                if (orders[i] == o) return true;
+            return false;
+        }
+
+        private static bool BelongsToScan(ExitScan s, Execution ex)
+        {
+            NinjaTrader.NinjaScript.StrategyBase owner = null;
+            try { owner = ex.Order == null ? null : ex.Order.GetOwnerStrategy(); }
+            catch { owner = null; }
+            if (s.Owner != null && owner != null)
+                return ReferenceEquals(s.Owner, owner);
+            return IsClosingOrderName(ex.Order);
+        }
+
+        private static bool IsSellExecution(Execution ex)
+        {
+            if (ex.Order != null)
+            {
+                OrderAction action = ex.Order.OrderAction;
+                if (action == OrderAction.Sell || action == OrderAction.SellShort) return true;
+                if (action == OrderAction.Buy || action == OrderAction.BuyToCover) return false;
+            }
+            return ex.MarketPosition == MarketPosition.Short;
+        }
+
+        private static bool IsClosingOrderName(Order o)
+        {
+            if (o == null || string.IsNullOrEmpty(o.Name)) return false;
+            return o.Name.StartsWith("Close", StringComparison.OrdinalIgnoreCase)
+                || o.Name.StartsWith("Exit", StringComparison.OrdinalIgnoreCase)
+                || o.Name.StartsWith("Flatten", StringComparison.OrdinalIgnoreCase);
         }
 
         private void SyncOrderList()
         {
+            SettleOutcomes();
             string sig;
             lock (sync)
             {
@@ -2236,43 +2503,63 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void RefreshOrderList()
         {
-            if (orderListPanel == null) return;
-            List<OrderRow> rows = new List<OrderRow>();
+            if (nfListPanel == null || filledListPanel == null || doneListPanel == null) return;
+            List<OrderRow> nf = new List<OrderRow>();
+            List<OrderRow> filled = new List<OrderRow>();
+            List<OrderRow> done = new List<OrderRow>();
             lock (sync)
             {
                 foreach (TrackedOrder t in tracked)
                 {
-                    bool filled = t.Order != null && t.Order.Filled > 0;
                     OrderRow row = new OrderRow();
                     row.Label = t.Label ?? "";
                     row.IsBuy = IsBuyAction(t.Action);
-                    row.Checkable = filled;
-                    row.Checked = t.SelectedForAtm;
                     row.Text = OrderListText(t);
-                    rows.Add(row);
+                    row.Completed = t.Completed;
+                    row.Won = t.Points >= 0;
+                    if (t.Completed)
+                        done.Add(row);
+                    else if (IsListedFilled(t))
+                    {
+                        row.Checkable = true;
+                        row.Checked = t.SelectedForAtm;
+                        filled.Add(row);
+                    }
+                    else
+                        nf.Add(row);
                 }
             }
 
-            orderListPanel.Children.Clear();
+            FillOrderSection(nfListPanel, nf, "No working orders");
+            FillOrderSection(filledListPanel, filled, "No filled orders");
+            FillOrderSection(doneListPanel, done, "No completed trades");
+        }
+
+        private void FillOrderSection(System.Windows.Controls.StackPanel panel, List<OrderRow> rows, string empty)
+        {
+            panel.Children.Clear();
             if (rows.Count == 0)
             {
-                orderListPanel.Children.Add(new System.Windows.Controls.TextBlock
+                panel.Children.Add(new System.Windows.Controls.TextBlock
                 {
-                    Text = "No KC orders",
+                    Text = empty,
                     Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
                     FontSize = 11,
-                    Margin = new Thickness(4, 4, 4, 4)
+                    Margin = new Thickness(4, 2, 4, 4)
                 });
                 return;
             }
 
             foreach (OrderRow row in rows)
             {
-                Brush rowBrush = new SolidColorBrush(OrderListColor(row.IsBuy));
+                Color color = row.Completed
+                    ? (row.Won ? Color.FromRgb(0x1E, 0x7A, 0x3C) : Color.FromRgb(0xA3, 0x24, 0x24))
+                    : OrderListColor(row.IsBuy);
+                Brush rowBrush = new SolidColorBrush(color);
                 if (rowBrush.CanFreeze) rowBrush.Freeze();
                 if (!row.Checkable)
                 {
-                    orderListPanel.Children.Add(new System.Windows.Controls.TextBlock
+                    panel.Children.Add(new System.Windows.Controls.TextBlock
                     {
                         Text = row.Text,
                         Foreground = rowBrush,
@@ -2298,7 +2585,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     Margin = new Thickness(2, 1, 2, 1)
                 };
                 box.Click += OnOrderCheck;
-                orderListPanel.Children.Add(box);
+                panel.Children.Add(box);
             }
         }
 
