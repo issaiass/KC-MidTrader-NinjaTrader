@@ -13,6 +13,7 @@
 //    * with two or more EMAs, track an EMA cross: Buy or Sell stays not filled until a later favorable cross, then the ATM stop is kept and the target waits for the next cross
 //    * MACD is a trigger, not a price. The Track window stores a magnitude. Buy waits for MACD to cross above it and Sell waits for MACD to cross below it. The order stays not filled until that cross, then a limit is sent at the Keltner midline and the selected ATM starts. On a filled order, SL / TP uses its own magnitude (default 0, a minus sign is ignored). At 0 a buy closes when MACD crosses down through 0 and a sell closes when MACD crosses up through 0. Any other magnitude closes either side when the absolute MACD level falls through it. A cross that is already true waits until MACD leaves the level and crosses again
 //    * CANCEL every order this tool placed with one click
+//    * Chart Trader Buy/Sell Mkt, Bid, and Ask orders are listed too. The selected ATM keeps its stop and target, and one checked filled order uses SL / TP
 //
 //  The section is only shown while a (visible) stock Keltner Channel is on the chart.
 //  The midband is recomputed internally with the SAME Period / Offset multiplier as the
@@ -160,6 +161,34 @@ namespace NinjaTrader.NinjaScript.Indicators
             public bool         MacdCloseCancelsStop;
             public int          EntryCrossBar = -1; // closed bar that opened the trade; that cross cannot close it
             public bool         ArmNoted;
+            public bool         QuickEntry;       // Chart Trader Buy/Sell Mkt, Bid, or Ask; not a midline order
+            public bool         QuickBracketsPlaced;
+        }
+
+        private enum QuickMode
+        {
+            Mkt,
+            Bid,
+            Ask
+        }
+
+        // A Chart Trader Mkt, Bid, or Ask click waiting for the entry order it submits.
+        private sealed class PendingQuick
+        {
+            public DateTime At;
+            public Account Account;
+            public bool IsBuy;
+            public QuickMode Mode;
+            public string AtmName;
+            public NinjaTrader.NinjaScript.AtmStrategy Atm;
+            public List<Order> Seen;     // orders already on the account when the button was pressed
+        }
+
+        private sealed class QuickButton
+        {
+            public System.Windows.Controls.Button Button;
+            public bool IsBuy;
+            public QuickMode Mode;
         }
 
         // A protective order to put back if cancelling the other ATM leg takes this one with it.
@@ -216,6 +245,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private readonly List<TrackedOrder> tracked = new List<TrackedOrder>();
         private readonly List<Account>      hookedAccounts = new List<Account>();
         private readonly Dictionary<string, bool> checkedLabels = new Dictionary<string, bool>();
+        private readonly List<PendingQuick> pendingQuick = new List<PendingQuick>();
+        private readonly List<QuickButton>  quickButtons = new List<QuickButton>();
 
         // ---------------------------------------------------------------- market / KC state
         private volatile bool kcFound;
@@ -284,7 +315,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         private string orderListSig;
         private Brush  panelBrush;
         private NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector atmSelector;
+        private AccountSelector accountSelector;
+        private bool   quickButtonsMissLogged;
         private int    suppressAtmEvents;
+        private int    suppressQuickAdopt;
         private int    inPrune;
         private System.Windows.Controls.Button            buyButton, sellButton, cancelButton, minusButton, plusButton, legButton;
         private bool panelInserted;
@@ -376,6 +410,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     DetectKeltner();
                     if (atmSelector == null) HookAtmSelector();
+                    if (quickButtons.Count == 0) HookQuickButtons();
                 });
 
             // EMA cross and MACD levels use the closed bar only, even in OnPriceChange mode.
@@ -589,34 +624,44 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (chosenAtm == null) chosenAtm = "";
 
             Order o;
+            System.Threading.Interlocked.Increment(ref suppressQuickAdopt);
             try
             {
-                if (chosenAtm.Length > 0)
+                try
                 {
-                    // ATM entry orders must be named "Entry". The Ord- label stays on our tracked order.
-                    o = acct.CreateOrder(Instrument, action, type.Value, OrderEntry.Manual, OrderTif, qty,
-                                         lmt, stp, string.Empty, "Entry", NinjaTrader.Core.Globals.MaxDate, null);
-                    System.Threading.Interlocked.Increment(ref suppressAtmEvents);
-                    try { NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(chosenAtm, o); }
-                    finally { System.Threading.Interlocked.Decrement(ref suppressAtmEvents); }
+                    if (chosenAtm.Length > 0)
+                    {
+                        // ATM entry orders must be named "Entry". The Ord- label stays on our tracked order.
+                        o = acct.CreateOrder(Instrument, action, type.Value, OrderEntry.Manual, OrderTif, qty,
+                                             lmt, stp, string.Empty, "Entry", NinjaTrader.Core.Globals.MaxDate, null);
+                        System.Threading.Interlocked.Increment(ref suppressAtmEvents);
+                        try { NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(chosenAtm, o); }
+                        finally { System.Threading.Interlocked.Decrement(ref suppressAtmEvents); }
+                    }
+                    else
+                    {
+                        o = acct.CreateOrder(Instrument, action, type.Value, OrderEntry.Manual, OrderTif, qty,
+                                             lmt, stp, string.Empty, OrderNamePrefix + (isBuy ? "Buy" : "Sell"),
+                                             NinjaTrader.Core.Globals.MaxDate, null);
+                        acct.Submit(new[] { o });
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    o = acct.CreateOrder(Instrument, action, type.Value, OrderEntry.Manual, OrderTif, qty,
-                                         lmt, stp, string.Empty, OrderNamePrefix + (isBuy ? "Buy" : "Sell"),
-                                         NinjaTrader.Core.Globals.MaxDate, null);
-                    acct.Submit(new[] { o });
+                    Print("KcMidTrader submit error: " + ex.Message);
+                    return label + "  Error: " + ex.Message;
                 }
             }
-            catch (Exception ex)
+            finally
             {
-                Print("KcMidTrader submit error: " + ex.Message);
-                return label + "  Error: " + ex.Message;
+                System.Threading.Interlocked.Decrement(ref suppressQuickAdopt);
             }
 
             HookAccount(acct);
             lock (sync)
             {
+                if (tracked.Any(x => x.Order == o))
+                    return label + "  already listed.";
                 TrackedOrder t = new TrackedOrder();
                 t.Order = o; t.Account = acct; t.Action = action; t.Quantity = qty;
                 t.AtmTemplate = atm; t.AtmName = chosenAtm; t.Track = track; t.Label = label;
@@ -731,7 +776,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             foreach (TrackedOrder t in snapshot)
             {
                 Order o = t.Order;
-                if (o == null || t.WaitCross || t.WaitMacd || !IsChangeable(o)) continue;
+                if (o == null || t.QuickEntry || t.WaitCross || t.WaitMacd || !IsChangeable(o)) continue;
 
                 bool   isBuy   = t.Action == OrderAction.Buy;
                 double target  = OffsetPrice(isBuy, mid);
@@ -769,7 +814,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         // Picks up working orders placed by this tool before a reload/restart.
-        // (ATM entries are named "Entry" by NinjaTrader and cannot be identified, so they are not adopted.)
+        // (ATM entries are named "Entry" by NinjaTrader and cannot be identified, so they are not adopted.
+        // Chart Trader Mkt, Bid, and Ask orders are added only when those buttons are clicked.)
         private void AdoptOrders()
         {
             try
@@ -818,6 +864,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         n++;
                         continue;
                     }
+                    if (t.QuickEntry) continue;
                     if (Order.IsTerminalState(t.Order.OrderState)) continue;
                     t.PendingReplace = false;   // a manual cancel must not be re-submitted
                     t.SwapAtm = false;
@@ -1670,6 +1717,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
 
             HookAtmSelector();
+            HookQuickButtons();
             RefreshOrderList();
         }
 
@@ -1792,6 +1840,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 atmSelector.SelectionChanged -= OnAtmSelectionChanged;
                 atmSelector = null;
+            }
+            UnhookQuickButtons();
+            if (accountSelector != null)
+            {
+                accountSelector.SelectionChanged -= OnChartAccountChanged;
+                accountSelector = null;
             }
             if (qtyBox != null)
             {
@@ -2320,6 +2374,423 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
+        private void HookQuickButtons()
+        {
+            if (chartWindow == null) return;
+            try
+            {
+                string[] ids =
+                {
+                    "ChartTraderControlBuyMarketButton",
+                    "ChartTraderControlSellMarketButton",
+                    "ChartTraderControlBuyMktButton",
+                    "ChartTraderControlSellMktButton",
+                    "ChartTraderControlBuyBidButton",
+                    "ChartTraderControlSellBidButton",
+                    "ChartTraderControlBuyAskButton",
+                    "ChartTraderControlSellAskButton"
+                };
+                foreach (string id in ids)
+                {
+                    System.Windows.Controls.Button button = chartWindow.FindFirst(id) as System.Windows.Controls.Button;
+                    bool isBuy;
+                    QuickMode mode;
+                    if (button != null && TryParseQuickId(id, out isBuy, out mode))
+                        AddQuickButton(button, isBuy, mode);
+                }
+                if (quickButtons.Count < 6)
+                {
+                    if (chartTraderGrid != null) WalkQuickButtons(chartTraderGrid);
+                    NinjaTrader.Gui.Chart.ChartTrader ct =
+                        chartWindow.FindFirst("ChartWindowChartTraderControl") as NinjaTrader.Gui.Chart.ChartTrader;
+                    if (ct != null) WalkQuickButtons(ct);
+                }
+            }
+            catch (Exception ex) { Print("KcMidTrader quick button error: " + ex.Message); }
+
+            if (quickButtons.Count == 0 && !quickButtonsMissLogged)
+            {
+                quickButtonsMissLogged = true;
+                Print("KcMidTrader: Chart Trader Mkt, Bid, and Ask buttons were not found.");
+            }
+            HookChartAccount();
+        }
+
+        private void WalkQuickButtons(DependencyObject root)
+        {
+            if (root == null) return;
+            int count;
+            try { count = VisualTreeHelper.GetChildrenCount(root); }
+            catch { return; }
+            for (int i = 0; i < count; i++)
+            {
+                DependencyObject child;
+                try { child = VisualTreeHelper.GetChild(root, i); }
+                catch { continue; }
+                System.Windows.Controls.Button button = child as System.Windows.Controls.Button;
+                if (button != null)
+                {
+                    bool isBuy;
+                    QuickMode mode;
+                    if (TryParseQuickCaption(ButtonCaption(button), out isBuy, out mode))
+                        AddQuickButton(button, isBuy, mode);
+                }
+                WalkQuickButtons(child);
+            }
+        }
+
+        private void AddQuickButton(System.Windows.Controls.Button button, bool isBuy, QuickMode mode)
+        {
+            if (button == null) return;
+            for (int i = 0; i < quickButtons.Count; i++)
+                if (quickButtons[i].Button == button) return;
+            button.AddHandler(UIElement.PreviewMouseLeftButtonDownEvent,
+                new MouseButtonEventHandler(OnQuickMouseDown), true);
+            quickButtons.Add(new QuickButton { Button = button, IsBuy = isBuy, Mode = mode });
+        }
+
+        private void UnhookQuickButtons()
+        {
+            for (int i = 0; i < quickButtons.Count; i++)
+            {
+                System.Windows.Controls.Button button = quickButtons[i].Button;
+                if (button == null) continue;
+                try
+                {
+                    button.RemoveHandler(UIElement.PreviewMouseLeftButtonDownEvent,
+                        new MouseButtonEventHandler(OnQuickMouseDown));
+                }
+                catch { }
+            }
+            quickButtons.Clear();
+        }
+
+        private void OnQuickMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            System.Windows.Controls.Button button = sender as System.Windows.Controls.Button;
+            QuickButton match = null;
+            for (int i = 0; i < quickButtons.Count; i++)
+            {
+                if (quickButtons[i].Button != button) continue;
+                match = quickButtons[i];
+                break;
+            }
+            if (match == null) return;
+
+            Account acct = SelectedAccount();
+            if (acct == null) return;
+            HookAccount(acct);
+            NinjaTrader.NinjaScript.AtmStrategy atm = SelectedAtm();
+            string key = atm == null ? "" : AtmTemplateKey(atm);
+            if (key == null) key = "";
+            List<Order> seen = SnapshotInstrumentOrders(acct);
+            lock (sync)
+            {
+                ExpireQuickClicks();
+                pendingQuick.Add(new PendingQuick
+                {
+                    At = DateTime.Now,
+                    Account = acct,
+                    IsBuy = match.IsBuy,
+                    Mode = match.Mode,
+                    AtmName = key,
+                    Atm = key.Length > 0 ? atm : null,
+                    Seen = seen
+                });
+            }
+        }
+
+        private List<Order> SnapshotInstrumentOrders(Account acct)
+        {
+            List<Order> seen = new List<Order>();
+            if (acct == null || Instrument == null) return seen;
+            try
+            {
+                Order[] orders;
+                lock (acct.Orders) orders = acct.Orders.ToArray();
+                foreach (Order existing in orders)
+                {
+                    if (existing == null || existing.Instrument == null) continue;
+                    if (existing.Instrument.FullName != Instrument.FullName) continue;
+                    seen.Add(existing);
+                }
+            }
+            catch { return null; }
+            return seen;
+        }
+
+        private void HookChartAccount()
+        {
+            if (chartWindow == null) return;
+            AccountSelector sel = chartWindow.FindFirst("ChartTraderControlAccountSelector") as AccountSelector;
+            if (sel != null && !ReferenceEquals(sel, accountSelector))
+            {
+                if (accountSelector != null)
+                    accountSelector.SelectionChanged -= OnChartAccountChanged;
+                accountSelector = sel;
+                accountSelector.SelectionChanged += OnChartAccountChanged;
+            }
+            HookAccount(SelectedAccount());
+        }
+
+        private void OnChartAccountChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+        {
+            HookAccount(SelectedAccount());
+        }
+
+        private static string ButtonCaption(System.Windows.Controls.Button button)
+        {
+            if (button == null) return "";
+            string text = ContentText(button.Content);
+            bool captionBuy;
+            QuickMode captionMode;
+            if (text.Length > 0 && TryParseQuickCaption(text, out captionBuy, out captionMode)) return text;
+            System.Text.StringBuilder joined = new System.Text.StringBuilder();
+            DependencyObject visual = button.Content as DependencyObject;
+            if (visual != null) AppendVisualText(visual, joined);
+            if (joined.Length == 0) AppendVisualText(button, joined);
+            if (joined.Length > 0) return joined.ToString();
+            object name = null;
+            try { name = button.GetValue(System.Windows.Automation.AutomationProperties.NameProperty); }
+            catch { name = null; }
+            text = ContentText(name);
+            if (text.Length > 0) return text;
+            return ContentText(button.ToolTip);
+        }
+
+        private static void AppendVisualText(DependencyObject node, System.Text.StringBuilder joined)
+        {
+            if (node == null || joined == null) return;
+            System.Windows.Controls.TextBlock block = node as System.Windows.Controls.TextBlock;
+            if (block != null && !string.IsNullOrWhiteSpace(block.Text))
+            {
+                if (joined.Length > 0) joined.Append(' ');
+                joined.Append(block.Text.Trim());
+            }
+            int count;
+            try { count = VisualTreeHelper.GetChildrenCount(node); }
+            catch { return; }
+            for (int i = 0; i < count; i++)
+            {
+                DependencyObject child;
+                try { child = VisualTreeHelper.GetChild(node, i); }
+                catch { continue; }
+                AppendVisualText(child, joined);
+            }
+        }
+
+        private static string ContentText(object content)
+        {
+            if (content == null) return "";
+            System.Windows.Controls.TextBlock block = content as System.Windows.Controls.TextBlock;
+            if (block != null && !string.IsNullOrWhiteSpace(block.Text)) return block.Text.Trim();
+            string text = content.ToString();
+            if (string.IsNullOrWhiteSpace(text)) return "";
+            text = text.Trim();
+            if (text == content.GetType().FullName) return "";
+            return text;
+        }
+
+        private static bool TryParseQuickId(string id, out bool isBuy, out QuickMode mode)
+        {
+            isBuy = false;
+            mode = QuickMode.Mkt;
+            if (string.IsNullOrEmpty(id)) return false;
+            string text = id.ToLowerInvariant();
+            if (text.IndexOf("sell", StringComparison.Ordinal) >= 0) isBuy = false;
+            else if (text.IndexOf("buy", StringComparison.Ordinal) >= 0) isBuy = true;
+            else return false;
+            if (text.IndexOf("market", StringComparison.Ordinal) >= 0 || text.IndexOf("mkt", StringComparison.Ordinal) >= 0)
+                mode = QuickMode.Mkt;
+            else if (text.IndexOf("bid", StringComparison.Ordinal) >= 0)
+                mode = QuickMode.Bid;
+            else if (text.IndexOf("ask", StringComparison.Ordinal) >= 0)
+                mode = QuickMode.Ask;
+            else
+                return false;
+            return true;
+        }
+
+        private static bool TryParseQuickCaption(string text, out bool isBuy, out QuickMode mode)
+        {
+            isBuy = false;
+            mode = QuickMode.Mkt;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string[] parts = Regex.Replace(text.Trim(), @"\s+", " ").Split(' ');
+            if (parts.Length < 2) return false;
+            if (parts[0].Equals("Buy", StringComparison.OrdinalIgnoreCase)) isBuy = true;
+            else if (parts[0].Equals("Sell", StringComparison.OrdinalIgnoreCase)) isBuy = false;
+            else return false;
+            if (parts[1].Equals("Mkt", StringComparison.OrdinalIgnoreCase) || parts[1].Equals("Market", StringComparison.OrdinalIgnoreCase))
+                mode = QuickMode.Mkt;
+            else if (parts[1].Equals("Bid", StringComparison.OrdinalIgnoreCase))
+                mode = QuickMode.Bid;
+            else if (parts[1].Equals("Ask", StringComparison.OrdinalIgnoreCase))
+                mode = QuickMode.Ask;
+            else
+                return false;
+            return true;
+        }
+
+        // Called with sync held. Returns the new tracked entry, or null.
+        private TrackedOrder TryAdoptQuickEntry(Order o, Account senderAccount)
+        {
+            if (o == null) return null;
+            if (System.Threading.Interlocked.CompareExchange(ref suppressQuickAdopt, 0, 0) != 0) return null;
+            if (tracked.Any(x => x.Order == o)) return null;
+            if (!IsQuickEntryName(o)) return null;
+            if (Order.IsTerminalState(o.OrderState) && o.Filled <= 0) return null;
+
+            ExpireQuickClicks();
+            bool buy = IsBuyAction(o.OrderAction);
+            Account orderAccount = o.Account ?? senderAccount;
+            PendingQuick match = null;
+            for (int i = 0; i < pendingQuick.Count; i++)
+            {
+                PendingQuick pending = pendingQuick[i];
+                if (pending.IsBuy != buy) continue;
+                if (!SameAccount(pending.Account, orderAccount)) continue;
+                if (pending.Mode == QuickMode.Mkt)
+                {
+                    if (o.OrderType != OrderType.Market) continue;
+                }
+                else if (o.OrderType != OrderType.Limit)
+                    continue;
+                if (pending.Seen != null)
+                {
+                    if (ListHasOrder(pending.Seen, o)) continue;
+                }
+                else
+                {
+                    DateTime when = o.Time;
+                    if (when.Year >= 2000 && when < pending.At.AddSeconds(-2)) continue;
+                }
+                match = pending;
+                break;
+            }
+            if (match == null) return null;
+            pendingQuick.Remove(match);
+
+            string atmName = match.AtmName ?? "";
+            TrackedOrder t = new TrackedOrder();
+            t.Order = o;
+            t.Account = orderAccount;
+            t.Action = o.OrderAction;
+            t.Quantity = o.Quantity > 0 ? o.Quantity : 1;
+            t.Label = NewOrderLabel();
+            t.Track = false;
+            t.QuickEntry = true;
+            t.AtmName = atmName;
+            t.AtmTemplate = atmName.Length > 0 ? match.Atm : null;
+            t.FollowAtm = atmName.Length > 0;
+            NoteFill(t);
+            try
+            {
+                NinjaTrader.NinjaScript.StrategyBase owner = o.GetOwnerStrategy();
+                if (owner != null) t.AtmOwner = owner;
+            }
+            catch { }
+            tracked.Add(t);
+            return t;
+        }
+
+        private void ExpireQuickClicks()
+        {
+            DateTime cutoff = DateTime.Now.AddSeconds(-5);
+            for (int i = pendingQuick.Count - 1; i >= 0; i--)
+                if (pendingQuick[i].At < cutoff) pendingQuick.RemoveAt(i);
+        }
+
+        private static bool ListHasOrder(List<Order> orders, Order o)
+        {
+            if (orders == null || o == null) return false;
+            for (int i = 0; i < orders.Count; i++)
+                if (ReferenceEquals(orders[i], o)) return true;
+            return false;
+        }
+
+        private static bool SameAccount(Account a, Account b)
+        {
+            if (a == null || b == null) return false;
+            if (ReferenceEquals(a, b)) return true;
+            return string.Equals(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsQuickEntryName(Order o)
+        {
+            if (o == null) return false;
+            string name = o.Name ?? "";
+            if (name.StartsWith("Stop", StringComparison.OrdinalIgnoreCase)) return false;
+            if (name.StartsWith("Target", StringComparison.OrdinalIgnoreCase)) return false;
+            if (IsClosingOrderName(o)) return false;
+            if (name.StartsWith(OrderNamePrefix, StringComparison.Ordinal)) return false;
+            return true;
+        }
+
+        private void ScheduleQuickEntry(TrackedOrder t)
+        {
+            if (t == null || ChartControl == null) return;
+            ChartControl.Dispatcher.InvokeAsync(delegate { FinishQuickEntry(t); });
+        }
+
+        private void FinishQuickEntry(TrackedOrder t)
+        {
+            if (t == null) return;
+            try
+            {
+                AttachWorkingLegs(t, true);
+                AttachWorkingLegs(t, false);
+                TryPlaceQuickBrackets(t);
+            }
+            catch (Exception ex) { Print("KcMidTrader quick entry error: " + ex.Message); }
+            SyncOrderList();
+        }
+
+        // Chart Trader already starts the selected ATM on these buttons. Place a bracket only
+        // when that did not happen, and only once, after the entry has a fill.
+        private void TryPlaceQuickBrackets(TrackedOrder t)
+        {
+            if (t == null || !UseChartTraderAtm) return;
+            NinjaTrader.NinjaScript.AtmStrategy atm;
+            string key;
+            lock (sync)
+            {
+                if (!t.QuickEntry || t.QuickBracketsPlaced || t.Completed) return;
+                if (t.Order == null || t.Order.Filled <= 0) return;
+                if (t.FillPrice <= 0 && t.Order.AverageFillPrice <= 0) return;
+                string name = t.Order.Name ?? "";
+                if (name.Equals("Entry", StringComparison.OrdinalIgnoreCase)) return;
+                RefreshAtmOwner(t);
+                if (t.AtmOwner != null) return;
+                if (t.StopOrders.Count > 0 || t.TargetOrders.Count > 0) return;
+                key = t.AtmName ?? "";
+                atm = t.AtmTemplate;
+                if (key.Length == 0 || atm == null) return;
+                t.QuickBracketsPlaced = true;
+            }
+
+            string stopError = PlaceQuickAtmLeg(t, true, atm, key);
+            string targetError = PlaceQuickAtmLeg(t, false, atm, key);
+            if (stopError != null) SetStatus(stopError);
+            else if (targetError != null) SetStatus(targetError);
+        }
+
+        private string PlaceQuickAtmLeg(TrackedOrder t, bool isStop, NinjaTrader.NinjaScript.AtmStrategy atm, string key)
+        {
+            if (atm == null || string.IsNullOrEmpty(key))
+                return "Select an ATM strategy in Chart Trader to use a fixed stop or target.";
+            double fill, price;
+            int qty;
+            string error;
+            if (!TryAtmProtectivePrice(t, isStop, atm, out fill, out qty, out price, out error))
+                return error;
+            if (fill <= 0) return "That order has no fill price yet.";
+            error = PlaceProtective(t, isStop, price, qty);
+            if (error != null) return error;
+            lock (sync) { AssignAtmLeg(t, isStop, key, atm); }
+            return null;
+        }
+
         private void OnAccountExecution(object sender, ExecutionEventArgs e)
         {
             if (e == null || e.Execution == null) return;
@@ -2335,6 +2806,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (o.Instrument == null || Instrument == null || o.Instrument.FullName != Instrument.FullName) return;
 
             bool ours = false;
+            TrackedOrder quick = null;
             lock (sync)
             {
                 foreach (TrackedOrder t in tracked)
@@ -2348,10 +2820,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                         if (owner != null) t.AtmOwner = owner;
                     }
                     catch { }
+                    if (t.QuickEntry) quick = t;
                     break;
                 }
+                if (!ours)
+                    quick = TryAdoptQuickEntry(o, sender as Account);
             }
-            if (!ours)
+            if (quick != null)
+                ScheduleQuickEntry(quick);
+            else if (!ours)
                 LinkChildOrder(o);
 
             if (o.OrderState == OrderState.Cancelled || o.OrderState == OrderState.Rejected)
@@ -2639,8 +3116,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                         && t.Order.OrderState != OrderState.CancelPending;
                     if (openEntry)
                     {
-                        // A market entry has no resting price. Re-submitting it would send a second order at 0.
-                        if (same || t.Order.OrderType == OrderType.Market) continue;
+                        // A market entry has no resting price. A Chart Trader Mkt, Bid, or Ask
+                        // order is not a midline order, so it is not cancelled and sent again.
+                        if (same || t.QuickEntry || t.Order.OrderType == OrderType.Market) continue;
                         double px = t.Order.OrderType == OrderType.Limit ? t.Order.LimitPrice : t.Order.StopPrice;
                         t.PendingReplace = true;
                         t.SwapAtm = true;
