@@ -26,7 +26,7 @@ Main features:
 - **Own quantity**: a Qty box with ▲▼ arrows, set to 1 by default and independent of Chart Trader's *Order qty*.
 - **Attached orders**: with *Track line* on, working orders are re-priced each time the line (plus offset) moves.
 - **KC order lists**: three exclusive lists. An order moves from **NF** (not filled) to **F** (filled, still open) to completed (**F-W-**points or **L-**points, 4 ticks = 1 point). It is never shown in two lists at once.
-- **ATM-aware**: changing the ATM strategy cancels and re-submits unfilled (NF) entries with the new template, and re-prices the stop/target of the filled (F) orders you check.
+- **ATM-aware**: changing the ATM strategy cancels and re-submits unfilled (NF) entries with the new template, and re-prices the stop and target of the filled (F) orders you check when those legs are still on the ATM. Check one filled order and use **SL / TP** to point its stop, its target, or both at an indicator, or set either leg to **None**. None cancels that working order and leaves the position open. With two or more EMAs on the chart, the target can be **EMA cross**: the resting target is cancelled and the position closes only when the two selected EMAs cross. A Keltner asks for the indicator and the band. A single-plot indicator asks only for the indicator. Two or more checked orders stay on the ATM switch.
 - **Cancel KC Orders**: cancels only the orders this tool placed.
 - **Appears only when relevant**: the section is shown only while a visible indicator with *"Keltner"* in its name is on the chart.
 
@@ -131,7 +131,7 @@ The order type depends on which side of the market the order price (line ± offs
 | List | Example | When |
 |---|---|---|
 | Not filled | `Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-NF` | Working, including a partial fill |
-| Filled | `Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-F` | Entry fully filled and the trade still open. The checkbox is only on this list: checked orders have their ATM stop/target re-priced when you change the ATM strategy |
+| Filled | `Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-F` | Entry fully filled and the trade still open. The checkbox is only on this list. Checked orders have an ATM stop or target re-priced when you change the ATM strategy, unless that leg is following an indicator, removed, or waiting for an EMA cross. One checked order shows **SL / TP**. **None** cancels the stop, the target, or both and leaves the position in this list. **EMA cross** closes it only after the two selected EMAs cross |
 | Completed | `Ord-af3658-Oct-10-26_18-35-17-560-BUY-1-F-W-5.25` or `…-BUY-1-L-4.75` | The filled quantity is closed. **W** is a win, **L** is a loss, and the last number is points (4 ticks = 1 point). A flat close is `F-W-0` |
 
 A cancel that never filled is removed and does not appear in any list.

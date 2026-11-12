@@ -9,6 +9,9 @@
 //    * show or hide that offset zone (light blue above, light red below)
 //    * BUY or SELL at the selected line plus that offset with one click (Midline by default)
 //    * keep those orders ATTACHED to the offset price (they follow the selected line as it moves)
+//    * on one checked filled order, point its stop or target at an indicator, remove either leg without closing the position, close the target on an EMA cross, or close either leg when MACD crosses a level
+//    * with two or more EMAs, track an EMA cross: Buy or Sell stays not filled until a later favorable cross, then the ATM stop is kept and the target waits for the next cross
+//    * MACD is a trigger, not a price: the order follows the Keltner midline and is sent only when the MACD line crosses the level from the window, including a buy above the market or a sell below it. A stop or target can close on a MACD level too
 //    * CANCEL every order this tool placed with one click
 //
 //  The section is only shown while a (visible) stock Keltner Channel is on the chart.
@@ -72,6 +75,24 @@ namespace NinjaTrader.NinjaScript.Indicators
 {
     public class KcMidTrader : Indicator
     {
+        // A protective leg stays on the ATM template, follows one plot, is removed, waits for an EMA cross (target only), or waits for a MACD level.
+        private enum LegFollow
+        {
+            Atm,
+            Indicator,
+            None,
+            EmaCross,
+            Macd
+        }
+
+        private enum FollowKind
+        {
+            Atm,
+            None,
+            Indicator,
+            EmaCross
+        }
+
         // ---------------------------------------------------------------- tracked orders
         private class TrackedOrder
         {
@@ -98,6 +119,87 @@ namespace NinjaTrader.NinjaScript.Indicators
             public NinjaTrader.NinjaScript.StrategyBase AtmOwner;
             public readonly List<Order> StopOrders = new List<Order>();
             public readonly List<Order> TargetOrders = new List<Order>();
+            public LegFollow StopSource;
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase StopIndicator;
+            public int          StopPlot;
+            public bool         StopPaused;
+            public bool         StopMissing;
+            public LegFollow TargetSource;
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase TargetIndicator;
+            public int          TargetPlot;
+            public bool         TargetPaused;
+            public bool         TargetMissing;
+            public readonly List<Order> CloseOrders = new List<Order>();
+            public readonly List<HeldLeg> Relink = new List<HeldLeg>();
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase TargetEmaA;
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase TargetEmaB;
+            public int          TargetEmaSign;
+            public bool         TargetCrossSent;
+            public bool         TargetCrossPending;
+            public bool         WaitCross;        // NF arm: no broker order until a later favorable EMA cross
+            public int          ArmSign;          // EMA A vs B on the closed bar when the arm was placed or last updated
+            public int          ArmBar;
+            public bool         WaitMacd;         // NF arm: no broker order until MACD crosses EntryMacdLevel
+            public double       EntryMacdLevel;
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase EntryMacd;
+            public int          EntryMacdSign;    // MACD vs level when the arm was placed or last updated
+            public int          EntryMacdBar = -1;
+            public bool         EntryMacdNoted;
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase EntryPriceInd; // Keltner the order price follows
+            public int          EntryPricePlot;
+            public bool         FollowThrough;    // keep following the Keltner price on the stop side of the market
+            public bool         StopMacdSet;
+            public double       StopMacdLevel;
+            public int          StopMacdSign;     // int.MinValue until the closed bar is known
+            public bool         TargetMacdSet;
+            public double       TargetMacdLevel;
+            public int          TargetMacdSign;
+            public bool         MacdCloseSent;
+            public bool         MacdClosePending;
+            public bool         MacdCloseCancelsStop;
+            public int          EntryCrossBar = -1; // closed bar that opened the trade; that cross cannot close it
+            public bool         ArmNoted;
+        }
+
+        // A protective order to put back if cancelling the other ATM leg takes this one with it.
+        private sealed class HeldLeg
+        {
+            public bool IsStop;
+            public Order Original;
+            public double Price;
+            public int Qty;
+            public bool Replaced;
+        }
+
+        private sealed class FollowPick
+        {
+            public string Text;
+            public KcSource Source;
+            public FollowKind Kind;
+            public override string ToString() { return Text ?? ""; }
+        }
+
+        private sealed class BandPick
+        {
+            public string Text;
+            public int Plot;
+            public override string ToString() { return Text ?? ""; }
+        }
+
+        private sealed class LegDialogRow
+        {
+            public bool IsStop;
+            public System.Windows.Controls.ComboBox SourceBox;
+            public System.Windows.Controls.ComboBox BandBox;
+            public System.Windows.Controls.ComboBox EmaABox;
+            public System.Windows.Controls.ComboBox EmaBBox;
+            public System.Windows.Controls.Panel EmaPanel;
+            public System.Windows.Controls.Button MacdButton;
+            public double MacdLevel;
+            public bool MacdSet;
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase MacdIndicator;
+            public int PriorIndex;
+            public bool MacdPromptOpen;
         }
 
         // A Keltner-type indicator found on the chart, and which of its plots is the midband.
@@ -106,6 +208,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase Indicator;
             public int    MidPlot;     // index into Values[]; -1 = use the middle value of the first 3 plots
             public string Label;
+            public bool   IsEmaCross;  // synthetic Track row; not a chart indicator
         }
 
         private readonly object             sync    = new object();
@@ -151,17 +254,38 @@ namespace NinjaTrader.NinjaScript.Indicators
         private List<KcSource> kcList = new List<KcSource>();
         private List<int>      linePlots = new List<int>();
         private volatile KcSource selectedKc;
+        private volatile KcSource keltnerPrice;   // Keltner whose line is the order price while MACD is only the trigger
+        private NinjaTrader.Gui.NinjaScript.IndicatorRenderBase keltnerIndicator;
+        private volatile NinjaTrader.Gui.NinjaScript.IndicatorRenderBase crossEmaA;
+        private volatile NinjaTrader.Gui.NinjaScript.IndicatorRenderBase crossEmaB;
+        private volatile bool crossConfigured;
+        private volatile int  emaOnChart;
+        // Not volatile: C# rejects volatile double (CS0677). Published by the volatile
+        // macdConfigured write below, which readers check before using this value.
+        private double macdLevel = double.NaN;
+        private volatile bool macdConfigured;
+        private string shownMacdText;
+        private volatile string liveAtmKey = "";
+        private volatile NinjaTrader.NinjaScript.AtmStrategy liveAtm;
+        private string crossEmaAName = "EMA A";
+        private string crossEmaBName = "EMA B";
+        private bool   crossPausedNoted;
         private volatile int   selectedPlot = int.MinValue;   // int.MinValue = not chosen yet
         private string selectedLineName = "Midline";
         private bool   suppressComboEvent;
         private bool   suppressLineEvent;
+        private bool   suppressLegDialog;
+        private bool   macdPromptOpen;
+        private bool   trackMacdPromptQueued;
+        private NinjaTrader.Gui.NinjaScript.IndicatorRenderBase pendingTrackMacd;
+        private KcSource pendingTrackPrevious;
         private string lastDiagnostic;
         private string orderListSig;
         private Brush  panelBrush;
         private NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector atmSelector;
         private int    suppressAtmEvents;
         private int    inPrune;
-        private System.Windows.Controls.Button            buyButton, sellButton, cancelButton, minusButton, plusButton;
+        private System.Windows.Controls.Button            buyButton, sellButton, cancelButton, minusButton, plusButton, legButton;
         private bool panelInserted;
         private bool tabHooked;
 
@@ -253,18 +377,44 @@ namespace NinjaTrader.NinjaScript.Indicators
                     if (atmSelector == null) HookAtmSelector();
                 });
 
-            KcSource src = selectedKc;
-            if (!kcFound || src == null)
+            // EMA cross and MACD levels use the closed bar only, even in OnPriceChange mode.
+            if (State == State.Realtime && IsFirstTickOfBar)
             {
-                if (State == State.Realtime) ProcessReplacementsAndPrune();
+                TrackEmaCrossNow();
+                TrackMacdNow();
+            }
+
+            KcSource src = selectedKc;
+            if (src != null && src.IsEmaCross)
+            {
+                if (State != State.Realtime) return;
+                UpdateReadout();
+                ProcessReplacementsAndPrune();
+                TrackProtectiveNow();
+                return;
+            }
+
+            // MACD selects the trigger. The order price is still the Keltner line.
+            KcSource price = PriceSource();
+            if (!kcFound || price == null)
+            {
+                if (State == State.Realtime)
+                {
+                    ProcessReplacementsAndPrune();
+                    TrackProtectiveNow();
+                }
                 return;
             }
 
             // The midband is read straight from the selected indicator's own plot, so it always
             // matches what is drawn on the chart (any Keltner variant, any settings, any input).
             double rawNow;
-            if (!TryReadMid(src, CurrentBar, out rawNow))
+            if (!TryReadMid(price, CurrentBar, out rawNow))
+            {
+                if (State == State.Realtime)
+                    TrackProtectiveNow();
                 return;
+            }
             double midNow = Instrument.MasterInstrument.RoundToTickSize(rawNow);
             lastMid = midNow;
 
@@ -279,13 +429,29 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (!IsFirstTickOfBar)
                     return;
                 double rawPrev;
-                if (TryReadMid(src, CurrentBar - 1, out rawPrev))
+                if (TryReadMid(price, CurrentBar - 1, out rawPrev))
                     TrackOrders(Instrument.MasterInstrument.RoundToTickSize(rawPrev));
             }
             else
             {
                 TrackOrders(midNow);
             }
+            TrackProtectiveNow();
+        }
+
+        // Same cadence as entry tracking. Each leg reads its own indicator, so a missing
+        // entry line does not stop a stop or target that is already following a plot.
+        private void TrackProtectiveNow()
+        {
+            if (State != State.Realtime) return;
+            int bar = CurrentBar;
+            if (TrackMode == NinjaTrader.NinjaScript.KcMidTraderTypes.KcTrackMode.OnBarClose)
+            {
+                if (!IsFirstTickOfBar) return;
+                bar = CurrentBar - 1;
+            }
+            if (bar < 0) return;
+            TrackProtective(bar);
         }
 
         // Latest valid midband value at or just before barIndex (an indicator calculated
@@ -293,15 +459,22 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool TryReadMid(KcSource src, int barIndex, out double value)
         {
             value = double.NaN;
-            int plot = ActivePlot(src);
+            if (src == null || src.Indicator == null) return false;
+            return TryReadSeries(src.Indicator, ActivePlot(src), barIndex, out value);
+        }
+
+        private bool TryReadSeries(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, int plot, int barIndex, out double value)
+        {
+            value = double.NaN;
+            if (ind == null) return false;
             try
             {
                 for (int i = barIndex; i >= 0 && i >= barIndex - 2; i--)
                 {
                     if (plot >= 0)
                     {
-                        if (src.Indicator.Values == null || plot >= src.Indicator.Values.Length) return false;
-                        Series<double> ser = src.Indicator.Values[plot];
+                        if (ind.Values == null || plot >= ind.Values.Length) return false;
+                        Series<double> ser = ind.Values[plot];
                         if (i < ser.Count && ser.IsValidDataPointAt(i))
                         {
                             value = ser.GetValueAt(i);
@@ -311,12 +484,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                     else
                     {
                         // Unknown plot names: midband = the middle of the first three plots.
-                        if (src.Indicator.Values.Length < 3) return false;
+                        if (ind.Values == null || ind.Values.Length < 3) return false;
                         double[] v = new double[3];
                         bool ok = true;
                         for (int p = 0; p < 3 && ok; p++)
                         {
-                            Series<double> ser = src.Indicator.Values[p];
+                            Series<double> ser = ind.Values[p];
                             ok = i < ser.Count && ser.IsValidDataPointAt(i);
                             if (ok) v[p] = ser.GetValueAt(i);
                         }
@@ -387,7 +560,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         // Returns a message for the status line. label null creates a new Ord- id.
         private string Submit(Account acct, OrderAction action, int qty, double price,
-                              NinjaTrader.NinjaScript.AtmStrategy atm, bool track, string label, bool followAtm, string atmName)
+                              NinjaTrader.NinjaScript.AtmStrategy atm, bool track, string label, bool followAtm, string atmName,
+                              bool followThrough = false)
         {
             bool   isBuy = action == OrderAction.Buy;
             double refPx = RefPrice(isBuy);
@@ -397,7 +571,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             OrderType? type = DesiredType(isBuy, price, refPx);
             if (type == null)
                 return "Order price is at the market - not placed.";
-            if (type.Value == OrderType.StopMarket &&
+            if (!followThrough && type.Value == OrderType.StopMarket &&
                 CrossBehavior == NinjaTrader.NinjaScript.KcMidTraderTypes.KcCrossBehavior.Block)
                 return string.Format("Blocked: order price {0} is {1} the market (a limit would fill now).",
                     Instrument.MasterInstrument.FormatPrice(price), isBuy ? "above" : "below");
@@ -445,6 +619,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 TrackedOrder t = new TrackedOrder();
                 t.Order = o; t.Account = acct; t.Action = action; t.Quantity = qty;
                 t.AtmTemplate = atm; t.AtmName = chosenAtm; t.Track = track; t.Label = label;
+                t.FollowThrough = followThrough;
                 t.FollowAtm = chosenAtm.Length > 0 || followAtm;
                 bool selected;
                 if (checkedLabels.TryGetValue(label, out selected))
@@ -480,7 +655,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 for (int i = tracked.Count - 1; i >= 0; i--)
                 {
                     TrackedOrder t = tracked[i];
-                    if (t.Order == null) { tracked.RemoveAt(i); continue; }
+                    if (t.Order == null)
+                    {
+                        if (!t.WaitCross && !t.WaitMacd) tracked.RemoveAt(i);
+                        continue;
+                    }
                     OrderState st = t.Order.OrderState;
 
                     NoteFill(t);
@@ -529,7 +708,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (remaining <= 0) continue;
                 NinjaTrader.NinjaScript.AtmStrategy atm = t.SwapAtm ? t.ReplaceAtm : t.AtmTemplate;
                 string atmName = t.SwapAtm ? (t.ReplaceAtmName ?? "") : (t.AtmName ?? "");
-                msg = "Replaced: " + Submit(t.Account, t.Action, remaining, t.ReplacePrice, atm, t.Track, t.Label, t.FollowAtm, atmName);
+                msg = "Replaced: " + Submit(t.Account, t.Action, remaining, t.ReplacePrice, atm, t.Track, t.Label, t.FollowAtm, atmName, t.FollowThrough);
             }
 
             if (msg != null) SetStatus(msg);
@@ -551,7 +730,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             foreach (TrackedOrder t in snapshot)
             {
                 Order o = t.Order;
-                if (!IsChangeable(o)) continue;
+                if (o == null || t.WaitCross || t.WaitMacd || !IsChangeable(o)) continue;
 
                 bool   isBuy   = t.Action == OrderAction.Buy;
                 double target  = OffsetPrice(isBuy, mid);
@@ -573,7 +752,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
 
                 // Offset price crossed to the other side of the market (or sits on it).
-                if (want == null || CrossBehavior == NinjaTrader.NinjaScript.KcMidTraderTypes.KcCrossBehavior.Block)
+                // A MACD entry keeps following the Keltner line on that side instead of pausing.
+                if (want == null || (!t.FollowThrough && CrossBehavior == NinjaTrader.NinjaScript.KcMidTraderTypes.KcCrossBehavior.Block))
                 {
                     if (!t.Paused) SetStatus("Tracking paused: order price crossed the market.");
                     t.Paused = true;
@@ -624,12 +804,20 @@ namespace NinjaTrader.NinjaScript.Indicators
         private int CancelAll()
         {
             List<TrackedOrder> list = new List<TrackedOrder>();
+            int n = 0;
             lock (sync)
             {
                 for (int i = tracked.Count - 1; i >= 0; i--)
                 {
                     TrackedOrder t = tracked[i];
-                    if (t.Order == null || Order.IsTerminalState(t.Order.OrderState)) continue;
+                    if (t.Order == null)
+                    {
+                        if (!t.WaitCross && !t.WaitMacd) continue;
+                        tracked.RemoveAt(i);
+                        n++;
+                        continue;
+                    }
+                    if (Order.IsTerminalState(t.Order.OrderState)) continue;
                     t.PendingReplace = false;   // a manual cancel must not be re-submitted
                     t.SwapAtm = false;
                     list.Add(t);
@@ -638,7 +826,6 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
             }
 
-            int n = 0;
             foreach (TrackedOrder t in list)
             {
                 try { t.Account.Cancel(new[] { t.Order }); n++; }
@@ -652,64 +839,65 @@ namespace NinjaTrader.NinjaScript.Indicators
         // =================================================================================
         private void DetectKeltner()
         {
-            List<KcSource> found = new List<KcSource>();
-            List<string>   onChart = new List<string>();
+            List<string> onChart = new List<string>();
             string filter = string.IsNullOrWhiteSpace(IndicatorNameFilter) ? "Keltner" : IndicatorNameFilter.Trim();
-            try
+            // Track stays on the name filter unless Toggle track is on. The current choice stays listed after lock.
+            List<KcSource> found = CollectSources(!trackPickerOn, onChart);
+            List<KcSource> all = trackPickerOn ? found : CollectSources(false, null);
+            int emas = 0;
+            bool pairAlive = false;
+            bool sawA = false, sawB = false;
+            foreach (KcSource k in all)
             {
-                if (ChartControl != null && ChartControl.Indicators != null)
-                {
-                    foreach (var item in ChartControl.Indicators)
-                    {
-                        NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind =
-                            item as NinjaTrader.Gui.NinjaScript.IndicatorRenderBase;
-                        if (ind == null || ReferenceEquals(ind, this)) continue;
-
-                        string typeName = ind.GetType().Name;
-                        string name     = ind.Name ?? typeName;
-                        onChart.Add(name);
-
-                        // Default list is the name filter (Keltner). Toggle track opens the list to every
-                        // visible indicator. The current choice stays listed after the list is locked again.
-                        bool matches = name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       typeName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
-                        bool keepCurrent = selectedKc != null && ReferenceEquals(ind, selectedKc.Indicator);
-                        if (!trackPickerOn && !matches && !keepCurrent)
-                            continue;
-                        if (!ind.IsVisible) continue;
-
-                        int midPlot = FindMidPlot(ind);
-                        if (midPlot == -2) continue;   // no usable plots
-
-                        KcSource src = new KcSource();
-                        src.Indicator = ind;
-                        src.MidPlot   = midPlot;
-                        src.Label     = string.Format("#{0}  {1}", found.Count + 1, SafeDisplayName(ind));
-                        found.Add(src);
-                    }
-                }
+                if (!IsEma(k) || k.Indicator == null) continue;
+                emas++;
+                if (ReferenceEquals(k.Indicator, crossEmaA)) sawA = true;
+                if (ReferenceEquals(k.Indicator, crossEmaB)) sawB = true;
             }
-            catch (Exception ex) { Print("KcMidTrader detect error: " + ex.Message); }
+            pairAlive = crossConfigured && sawA && sawB && !ReferenceEquals(crossEmaA, crossEmaB);
+            emaOnChart = emas;
+            if (!pairAlive)
+                crossConfigured = false;
+            // EMA cross is a Track row, not a chart study. It needs two EMAs and a real indicator so the panel stays up.
+            if (emas >= 2 && found.Count > 0)
+            {
+                KcSource cross = new KcSource();
+                cross.IsEmaCross = true;
+                cross.MidPlot = -2;
+                cross.Label = "EMA cross";
+                found.Add(cross);
+            }
 
             // Rebuild the selector only if the set of indicators (or their settings/labels) changed.
             bool changed = found.Count != kcList.Count;
             if (!changed)
                 for (int i = 0; i < found.Count; i++)
-                    if (!ReferenceEquals(found[i].Indicator, kcList[i].Indicator) || found[i].Label != kcList[i].Label)
+                    if (found[i].IsEmaCross != kcList[i].IsEmaCross
+                        || !ReferenceEquals(found[i].Indicator, kcList[i].Indicator)
+                        || found[i].Label != kcList[i].Label)
                     { changed = true; break; }
 
             if (changed)
             {
                 KcSource prev = selectedKc;
+                bool wasCross = prev != null && prev.IsEmaCross;
                 kcList = found;
                 // Keep the user's choice if that indicator is still on the chart; otherwise use the first listed.
-                KcSource keep = prev == null ? null : kcList.FirstOrDefault(x => ReferenceEquals(x.Indicator, prev.Indicator));
+                KcSource keep = null;
+                if (wasCross)
+                    keep = kcList.FirstOrDefault(x => x.IsEmaCross);
+                else if (prev != null)
+                    keep = kcList.FirstOrDefault(x => !x.IsEmaCross && ReferenceEquals(x.Indicator, prev.Indicator));
                 selectedKc = keep ?? (kcList.Count > 0 ? kcList[0] : null);
+                if (wasCross && (selectedKc == null || !selectedKc.IsEmaCross))
+                    lastMid = double.NaN;
+                RememberKeltner();
                 RefreshCombo();
                 RefreshLineCombo(keep == null);
             }
 
             kcFound = selectedKc != null;
+            RememberKeltner();
 
             // Help in the NinjaScript Output window when nothing matches.
             string diag = kcFound ? null
@@ -720,6 +908,62 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             if (panel != null)
                 panel.Visibility = kcFound ? Visibility.Visible : Visibility.Collapsed;
+            RememberAtm();
+        }
+
+        // Visible chart indicators with a usable plot. nameFilter limits the list to IndicatorNameFilter
+        // (and the indicator Track is already on). The SL/TP window asks for the full set.
+        // onChart, when supplied, receives every indicator name seen, including ones left out of the list.
+        private List<KcSource> CollectSources(bool nameFilter, List<string> onChart)
+        {
+            List<KcSource> found = new List<KcSource>();
+            string filter = string.IsNullOrWhiteSpace(IndicatorNameFilter) ? "Keltner" : IndicatorNameFilter.Trim();
+            try
+            {
+                if (ChartControl != null && ChartControl.Indicators != null)
+                {
+                    foreach (var item in ChartControl.Indicators)
+                    {
+                        try
+                        {
+                            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind =
+                                item as NinjaTrader.Gui.NinjaScript.IndicatorRenderBase;
+                            if (ind == null || ReferenceEquals(ind, this)) continue;
+
+                            string typeName = ind.GetType().Name;
+                            string name     = ind.Name ?? typeName;
+                            if (onChart != null) onChart.Add(name);
+
+                            if (nameFilter)
+                            {
+                                bool matches = name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                               typeName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+                                bool keepCurrent = selectedKc != null && ReferenceEquals(ind, selectedKc.Indicator);
+                                if (!matches && !keepCurrent)
+                                    continue;
+                            }
+                            if (!ind.IsVisible) continue;
+
+                            int midPlot = FindMidPlot(ind);
+                            // A two-plot EMA, or one whose series is not ready yet, still belongs in the SL/TP list.
+                            if (midPlot == -2)
+                            {
+                                if (!HasReadablePlot(ind)) continue;
+                                midPlot = 0;
+                            }
+
+                            KcSource src = new KcSource();
+                            src.Indicator = ind;
+                            src.MidPlot   = midPlot;
+                            src.Label     = string.Format("#{0}  {1}", found.Count + 1, SafeDisplayName(ind));
+                            found.Add(src);
+                        }
+                        catch (Exception ex) { Print("KcMidTrader detect error: " + ex.Message); }
+                    }
+                }
+            }
+            catch (Exception ex) { Print("KcMidTrader detect error: " + ex.Message); }
+            return found;
         }
 
         // Index of the midband plot: by name (mid/middle/center/basis...), else stock order (Midline first
@@ -741,7 +985,21 @@ namespace NinjaTrader.NinjaScript.Indicators
                     }
             }
             if (n >= 3) return -1;
-            return n == 1 ? 0 : -2;
+            if (n == 1) return 0;
+            // Two plots, or plots that exist before Values is filled: the first plot is usable.
+            int plotCount = ind.Plots == null ? 0 : ind.Plots.Length;
+            return plotCount > 0 ? 0 : -2;
+        }
+
+        private static bool HasReadablePlot(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
+        {
+            if (ind == null) return false;
+            try
+            {
+                if (ind.Plots != null && ind.Plots.Length > 0) return true;
+                return ind.Values != null && ind.Values.Length > 0;
+            }
+            catch { return false; }
         }
 
         private static string SafeDisplayName(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
@@ -753,6 +1011,63 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             catch { }
             return ind.Name ?? ind.GetType().Name;
+        }
+
+        private string NameFilter()
+        {
+            return string.IsNullOrWhiteSpace(IndicatorNameFilter) ? "Keltner" : IndicatorNameFilter.Trim();
+        }
+
+        private static bool IsNamed(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, string filter)
+        {
+            if (ind == null || string.IsNullOrWhiteSpace(filter)) return false;
+            string typeName = "";
+            string name = "";
+            try { typeName = ind.GetType().Name ?? ""; } catch { typeName = ""; }
+            try { name = ind.Name ?? ""; } catch { name = ""; }
+            return typeName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Keeps the Keltner used as the order price. Selecting MACD does not replace it.
+        private void RememberKeltner()
+        {
+            string filter = NameFilter();
+            if (selectedKc != null && !selectedKc.IsEmaCross && selectedKc.Indicator != null
+                && IsNamed(selectedKc.Indicator, filter))
+            {
+                keltnerPrice = selectedKc;
+                keltnerIndicator = selectedKc.Indicator;
+                return;
+            }
+
+            KcSource still = null;
+            if (keltnerIndicator != null)
+            {
+                for (int i = 0; i < kcList.Count; i++)
+                    if (!kcList[i].IsEmaCross && ReferenceEquals(kcList[i].Indicator, keltnerIndicator))
+                    { still = kcList[i]; break; }
+            }
+            if (still == null)
+            {
+                for (int i = 0; i < kcList.Count; i++)
+                {
+                    KcSource k = kcList[i];
+                    if (k.IsEmaCross || k.Indicator == null || IsMacd(k)) continue;
+                    if (IsNamed(k.Indicator, filter)) { still = k; break; }
+                }
+            }
+            keltnerPrice = still;
+            keltnerIndicator = still == null ? null : still.Indicator;
+        }
+
+        // Price the working order follows. MACD mode uses the Keltner line, not the oscillator.
+        private KcSource PriceSource()
+        {
+            KcSource src = selectedKc;
+            if (src != null && IsMacd(src)) return keltnerPrice;
+            if (src != null && src.IsEmaCross) return null;
+            return src;
         }
 
         private void RefreshCombo()
@@ -778,12 +1093,134 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (suppressComboEvent || kcCombo == null) return;
             int idx = kcCombo.SelectedIndex;
             if (idx < 0 || idx >= kcList.Count) return;
-            selectedKc = kcList[idx];
+            KcSource pick = kcList[idx];
+            if (IsMacd(pick))
+            {
+                // SelectionChanged runs while the popup is still open. A dialog here is closed
+                // by that popup and never appears. DropDownClosed opens it after the popup is gone.
+                if (macdPromptOpen) return;
+                pendingTrackMacd = pick.Indicator;
+                pendingTrackPrevious = selectedKc;
+                if (!kcCombo.IsDropDownOpen)
+                    QueueTrackMacdPrompt();
+                return;
+            }
+            pendingTrackMacd = null;
+            if (pick.IsEmaCross)
+            {
+                KcSource previous = selectedKc;
+                if (!ShowEmaCrossDialog())
+                {
+                    RestoreTrackSelection(previous);
+                    return;
+                }
+                int crossIdx = IndexOfEmaCross();
+                if (crossIdx < 0)
+                {
+                    RestoreTrackSelection(previous);
+                    SetStatusNow("EMA cross needs two EMAs.");
+                    return;
+                }
+                suppressComboEvent = true;
+                try { kcCombo.SelectedIndex = crossIdx; }
+                finally { suppressComboEvent = false; }
+                selectedKc = kcList[crossIdx];
+                kcFound = true;
+                lastMid = double.NaN;
+                RefreshLineCombo(true);
+                SetStatusNow("Tracking EMA cross. Buy when " + crossEmaAName + " crosses above " + crossEmaBName
+                    + ". Sell when " + crossEmaAName + " crosses below " + crossEmaBName + ".");
+                if (ChartControl != null) ChartControl.InvalidateVisual();
+                return;
+            }
+            selectedKc = pick;
             kcFound    = true;
+            RememberKeltner();
             lastMid    = double.NaN;   // readout refreshes on the next tick with the new line
             RefreshLineCombo(true);
-            SetStatusNow("Tracking " + kcList[idx].Label + ". Line reset to " + selectedLineName + ".");
+            SetStatusNow("Tracking " + pick.Label + ". Line reset to " + selectedLineName + ".");
             RereadAndTrack();
+        }
+
+        private int IndexOfEmaCross()
+        {
+            for (int i = 0; i < kcList.Count; i++)
+                if (kcList[i].IsEmaCross) return i;
+            return -1;
+        }
+
+        // Runs after the Track dropdown has closed. Cancel puts the previous indicator back.
+        private void FinishTrackMacdPrompt(KcSource previous, NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
+        {
+            int idx = -1;
+            if (ind != null)
+            {
+                for (int i = 0; i < kcList.Count; i++)
+                    if (!kcList[i].IsEmaCross && ReferenceEquals(kcList[i].Indicator, ind))
+                    { idx = i; break; }
+            }
+            if (idx < 0)
+                return;
+            // -1 means the popup is still settling. A different indicator means the user moved on.
+            int shown = kcCombo == null ? -1 : kcCombo.SelectedIndex;
+            if (shown >= 0 && shown < kcList.Count && shown != idx)
+            {
+                bool stillPrevious = false;
+                if (previous != null && previous.IsEmaCross)
+                    stillPrevious = kcList[shown].IsEmaCross;
+                else if (previous != null)
+                    stillPrevious = !kcList[shown].IsEmaCross
+                        && ReferenceEquals(kcList[shown].Indicator, previous.Indicator);
+                if (!stillPrevious)
+                    return;
+            }
+
+            RememberKeltner();
+            if (keltnerPrice == null || keltnerPrice.Indicator == null)
+            {
+                RestoreTrackSelection(previous);
+                SetStatusNow("MACD needs a Keltner Channel on this chart. The order price is that midline.");
+                return;
+            }
+
+            double level;
+            if (!PromptTrackMacd(kcList[idx], out level))
+            {
+                RestoreTrackSelection(previous);
+                return;
+            }
+            suppressComboEvent = true;
+            try { if (kcCombo != null) kcCombo.SelectedIndex = idx; }
+            finally { suppressComboEvent = false; }
+            macdLevel = level;
+            macdConfigured = true;
+            selectedKc = kcList[idx];
+            kcFound = true;
+            lastMid = double.NaN;
+            shownMacdText = null;
+            RefreshLineCombo(true);
+            SetStatusNow("Tracking the Keltner " + selectedLineName + ". MACD level is " + FormatMacd(level)
+                + ". Buy or Sell uses this level and waits for the cross.");
+            UpdateReadout();
+            if (ChartControl != null) ChartControl.InvalidateVisual();
+        }
+
+        // The combo can be rebuilt while the modal is open, so restore by indicator, not by the old object.
+        private void RestoreTrackSelection(KcSource previous)
+        {
+            int back = -1;
+            if (previous != null && previous.IsEmaCross)
+                back = IndexOfEmaCross();
+            else if (previous != null)
+            {
+                for (int i = 0; i < kcList.Count; i++)
+                    if (!kcList[i].IsEmaCross && ReferenceEquals(kcList[i].Indicator, previous.Indicator))
+                    { back = i; break; }
+            }
+            suppressComboEvent = true;
+            try { if (kcCombo != null) kcCombo.SelectedIndex = back; }
+            finally { suppressComboEvent = false; }
+            if (back >= 0) selectedKc = kcList[back];
         }
 
         // Re-scan the chart every time the list is opened, so it always reflects what's on the chart.
@@ -792,32 +1229,76 @@ namespace NinjaTrader.NinjaScript.Indicators
             DetectKeltner();
         }
 
+        // The popup has released the mouse. Open the MACD level window on the next dispatcher turn.
+        private void OnKcComboClosed(object sender, EventArgs e)
+        {
+            if (pendingTrackMacd == null || kcCombo == null || macdPromptOpen)
+                return;
+            int idx = kcCombo.SelectedIndex;
+            bool kept = idx >= 0 && idx < kcList.Count
+                && !kcList[idx].IsEmaCross
+                && ReferenceEquals(kcList[idx].Indicator, pendingTrackMacd);
+            if (!kept)
+            {
+                pendingTrackMacd = null;
+                return;
+            }
+            QueueTrackMacdPrompt();
+        }
+
+        private void QueueTrackMacdPrompt()
+        {
+            if (trackMacdPromptQueued || macdPromptOpen || pendingTrackMacd == null || kcCombo == null)
+                return;
+            trackMacdPromptQueued = true;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind = pendingTrackMacd;
+            KcSource previous = pendingTrackPrevious;
+            kcCombo.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                trackMacdPromptQueued = false;
+                if (macdPromptOpen || !ReferenceEquals(pendingTrackMacd, ind))
+                    return;
+                if (kcCombo != null && kcCombo.IsDropDownOpen)
+                {
+                    QueueTrackMacdPrompt();
+                    return;
+                }
+                pendingTrackMacd = null;
+                macdPromptOpen = true;
+                try { FinishTrackMacdPrompt(previous, ind); }
+                finally { macdPromptOpen = false; }
+            }), System.Windows.Threading.DispatcherPriority.Background);
+        }
+
         // resetToMidline is true when the tracked indicator changed. The same indicator keeps the user's line.
         private void RefreshLineCombo(bool resetToMidline)
         {
             if (lineCombo == null) return;
             KcSource src = selectedKc;
+            if (src != null && src.IsEmaCross)
+            {
+                suppressLineEvent = true;
+                try
+                {
+                    lineCombo.Items.Clear();
+                    lineCombo.Items.Add("Cross");
+                    linePlots = new List<int>();
+                    lineCombo.SelectedIndex = 0;
+                    lineCombo.IsEnabled = false;
+                    selectedPlot = int.MinValue;
+                    selectedLineName = "Cross";
+                }
+                finally { suppressLineEvent = false; }
+                ApplyLineButtons("Cross");
+                return;
+            }
+            // MACD is the trigger. The Line list is the Keltner channel the order price follows.
+            KcSource lineSrc = src != null && IsMacd(src) ? keltnerPrice : src;
             List<int> plots = new List<int>();
             List<string> names = new List<string>();
-            int mid = src == null ? -2 : src.MidPlot;
+            CollectPlots(lineSrc, plots, names);
 
-            if (src != null && src.Indicator != null && src.Indicator.Plots != null && src.Indicator.Values != null)
-            {
-                int n = Math.Min(src.Indicator.Plots.Length, src.Indicator.Values.Length);
-                if (mid < 0 && n >= 3)
-                {
-                    plots.Add(-1);
-                    names.Add("Midline");
-                }
-                for (int i = 0; i < n; i++)
-                {
-                    string pn = src.Indicator.Plots[i] != null ? src.Indicator.Plots[i].Name : null;
-                    if (string.IsNullOrWhiteSpace(pn)) pn = "Plot " + (i + 1);
-                    plots.Add(i);
-                    names.Add(pn);
-                }
-            }
-
+            int mid = lineSrc == null ? -2 : lineSrc.MidPlot;
             int prefer = selectedPlot;
             if (resetToMidline || prefer == int.MinValue || !plots.Contains(prefer))
             {
@@ -844,6 +1325,27 @@ namespace NinjaTrader.NinjaScript.Indicators
             ApplyLineButtons(selectedLineName);
         }
 
+        // Named plots, plus a synthetic Midline when the first three plots have no mid name.
+        private static void CollectPlots(KcSource src, List<int> plots, List<string> names)
+        {
+            int mid = src == null ? -2 : src.MidPlot;
+            if (src == null || src.Indicator == null || src.Indicator.Plots == null || src.Indicator.Values == null)
+                return;
+            int n = Math.Min(src.Indicator.Plots.Length, src.Indicator.Values.Length);
+            if (mid < 0 && n >= 3)
+            {
+                plots.Add(-1);
+                names.Add("Midline");
+            }
+            for (int i = 0; i < n; i++)
+            {
+                string pn = src.Indicator.Plots[i] != null ? src.Indicator.Plots[i].Name : null;
+                if (string.IsNullOrWhiteSpace(pn)) pn = "Plot " + (i + 1);
+                plots.Add(i);
+                names.Add(pn);
+            }
+        }
+
         private void OnLineComboChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
         {
             e.Handled = true;
@@ -868,7 +1370,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         // Read the selected plot now and re-price working orders. Safe to call from the UI thread.
         private void RereadAndTrack()
         {
-            KcSource src = selectedKc;
+            KcSource src = PriceSource();
             if (src == null || CurrentBar < 0) return;
             double raw;
             try
@@ -939,10 +1441,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 Height = 24, MinWidth = 0, HorizontalAlignment = HorizontalAlignment.Stretch,
                 IsEnabled = false,
-                ToolTip = "Indicator the orders follow. Locked on the Keltner channel until Toggle track is checked."
+                ToolTip = "Indicator the orders follow. Locked on the Keltner channel until Toggle track is checked. MACD keeps the Keltner line as the price and uses its level only as the trigger."
             };
             kcCombo.SelectionChanged += OnKcComboChanged;
             kcCombo.DropDownOpened   += OnKcComboOpened;
+            kcCombo.DropDownClosed   += OnKcComboClosed;
             System.Windows.Controls.Grid.SetColumn(kcLabel, 0);
             System.Windows.Controls.Grid.SetColumn(kcCombo, 1);
             kcRow.Children.Add(kcLabel); kcRow.Children.Add(kcCombo);
@@ -959,7 +1462,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             lineCombo = new System.Windows.Controls.ComboBox
             {
                 Height = 24, MinWidth = 0, HorizontalAlignment = HorizontalAlignment.Stretch,
-                ToolTip = "Plot the KC orders follow. Midline is selected by default."
+                ToolTip = "Keltner plot the orders follow. Midline is selected by default. With MACD in Track, this line is still the order price and MACD is only the trigger."
             };
             lineCombo.SelectionChanged += OnLineComboChanged;
             System.Windows.Controls.Grid.SetColumn(lineLabel, 0);
@@ -1125,7 +1628,20 @@ namespace NinjaTrader.NinjaScript.Indicators
             System.Windows.Controls.StackPanel orderLists = new System.Windows.Controls.StackPanel();
             orderLists.Children.Add(MakeOrderSection("Not filled", "Working orders that are not filled.", nfListPanel));
             orderLists.Children.Add(MakeOrderDivider());
-            orderLists.Children.Add(MakeOrderSection("Filled", "Filled orders still open. Check one to include it when the ATM strategy changes.", filledListPanel));
+            orderLists.Children.Add(MakeOrderSection("Filled", "Filled orders still open. Check one to set its stop or target, or to include it when the ATM strategy changes.", filledListPanel));
+            legButton = new System.Windows.Controls.Button
+            {
+                Content = "SL / TP",
+                Height = 24,
+                Margin = new Thickness(4, 2, 4, 4),
+                Style = null,
+                Background = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                Foreground = Brushes.White,
+                Visibility = Visibility.Collapsed,
+                ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close either leg when MACD crosses a level."
+            };
+            legButton.Click += OnLegButtonClick;
+            orderLists.Children.Add(legButton);
             orderLists.Children.Add(MakeOrderDivider());
             orderLists.Children.Add(MakeOrderSection("Completed", "Closed trades. W is a win and L is a loss. The last number is points (4 ticks = 1 point).", doneListPanel));
             System.Windows.Controls.Border orderListBorder = new System.Windows.Controls.Border
@@ -1255,6 +1771,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (buyButton    != null) buyButton.Click    -= OnBuyClick;
             if (sellButton   != null) sellButton.Click   -= OnSellClick;
             if (cancelButton != null) cancelButton.Click -= OnCancelClick;
+            if (legButton != null) legButton.Click -= OnLegButtonClick;
             if (minusButton  != null) minusButton.Click  -= OnMinusClick;
             if (plusButton   != null) plusButton.Click   -= OnPlusClick;
             if (offsetMinusButton != null) offsetMinusButton.Click -= OnOffsetMinusClick;
@@ -1266,6 +1783,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 kcCombo.SelectionChanged -= OnKcComboChanged;
                 kcCombo.DropDownOpened   -= OnKcComboOpened;
+                kcCombo.DropDownClosed   -= OnKcComboClosed;
             }
             if (lineCombo != null)
                 lineCombo.SelectionChanged -= OnLineComboChanged;
@@ -1328,6 +1846,21 @@ namespace NinjaTrader.NinjaScript.Indicators
             return sel != null ? sel.SelectedAtmStrategy : null;
         }
 
+        // Cached on the UI thread. The cross fires on the data thread and must not touch the selector.
+        private void RememberAtm()
+        {
+            if (!UseChartTraderAtm)
+            {
+                liveAtmKey = "";
+                liveAtm = null;
+                return;
+            }
+            NinjaTrader.NinjaScript.AtmStrategy atm = SelectedAtm();
+            string key = atm == null ? "" : AtmTemplateKey(atm);
+            liveAtm = key != null && key.Length > 0 ? atm : null;
+            liveAtmKey = key ?? "";
+        }
+
         private int ReadQty()
         {
             if (qtySelector != null)
@@ -1379,6 +1912,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             DetectKeltner();
             if (!kcFound)             { SetStatusNow("No Keltner Channel on this chart."); return; }
             if (State != State.Realtime) { SetStatusNow("Waiting for real-time data..."); return; }
+            if (selectedKc != null && selectedKc.IsEmaCross)
+            {
+                ArmEmaCrossFromUi(action);
+                UpdateReadout();
+                return;
+            }
+            if (selectedKc != null && IsMacd(selectedKc))
+            {
+                ArmMacdFromUi(action);
+                UpdateReadout();
+                return;
+            }
 
             double mid = lastMid;
             if (double.IsNaN(mid))    { SetStatusNow("Midband not available yet."); return; }
@@ -1522,11 +2067,16 @@ namespace NinjaTrader.NinjaScript.Indicators
             double mid = lastMid;
             int count;
             lock (sync) count = tracked.Count;
-            if (mid.ApproxCompare(shownMid) == 0 && count == shownCount) return;
-            shownMid = mid; shownCount = count;
+            bool macdMode = selectedKc != null && IsMacd(selectedKc);
+            string macdText = macdMode ? (macdConfigured ? FormatMacd(macdLevel) : "--") : null;
+            if (mid.ApproxCompare(shownMid) == 0 && count == shownCount && shownMacdText == macdText) return;
+            shownMid = mid;
+            shownCount = count;
+            shownMacdText = macdText;
             if (ChartControl == null) return;
 
             string text = double.IsNaN(mid) ? "--" : Instrument.MasterInstrument.FormatPrice(mid);
+            if (macdText != null) text += "  MACD " + macdText;
             if (count > 0) text += string.Format("  [{0}]", count);
             ChartControl.Dispatcher.InvokeAsync(() => { if (midText != null) midText.Text = text; });
         }
@@ -1536,6 +2086,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             base.OnRender(chartControl, chartScale);
             if (!showZone || !kcFound || ChartPanel == null || chartScale == null || RenderTarget == null)
+                return;
+            if (selectedKc != null && selectedKc.IsEmaCross)
                 return;
 
             int n = ClampOffset(ticksOffset);
@@ -1801,6 +2353,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (!ours)
                 LinkChildOrder(o);
 
+            if (o.OrderState == OrderState.Cancelled || o.OrderState == OrderState.Rejected)
+                OnProtectiveState(o);
+
             if (o.OrderState == OrderState.Cancelled || o.OrderState == OrderState.Filled)
                 ProcessReplacementsAndPrune();
             SyncOrderList();
@@ -1818,9 +2373,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             try { owner = o.GetOwnerStrategy(); }
             catch { owner = null; }
 
+            Account rejectAccount = null;
             lock (sync)
             {
-                if (tracked.Any(t => t.StopOrders.Contains(o) || t.TargetOrders.Contains(o)))
+                if (tracked.Any(t => ContainsOrder(t.StopOrders, o) || ContainsOrder(t.TargetOrders, o)))
                     return;
 
                 TrackedOrder match = null;
@@ -1828,12 +2384,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     foreach (TrackedOrder t in tracked)
                     {
-                        if (t.AtmOwner == null)
-                        {
-                            try { t.AtmOwner = t.Order == null ? null : t.Order.GetOwnerStrategy(); }
-                            catch { t.AtmOwner = null; }
-                        }
-                        if (t.AtmOwner != null && ReferenceEquals(t.AtmOwner, owner) && !HasChildNamed(t, name))
+                        RefreshAtmOwner(t);
+                        if (t.AtmOwner == null || !ReferenceEquals(t.AtmOwner, owner)) continue;
+                        // A removed leg still owns this strategy, even when the cancelled order kept the name.
+                        if (RejectsChild(t, stop) || !HasChildNamed(t, name))
                         {
                             match = t;
                             break;
@@ -1846,17 +2400,42 @@ namespace NinjaTrader.NinjaScript.Indicators
                     {
                         if (t.Account != o.Account || t.Order == null || t.Order.Filled <= 0) continue;
                         if (t.AtmTemplate == null && t.AtmOwner == null) continue;
-                        if (HasChildNamed(t, name)) continue;
+                        if (HasChildNamed(t, name) && !RejectsChild(t, stop)) continue;
                         if (match == null || t.Order.Time > match.Order.Time)
                             match = t;
                     }
                 }
                 if (match == null) return;
                 if (match.AtmOwner == null && owner != null) match.AtmOwner = owner;
-                if (stop) match.StopOrders.Add(o);
-                else match.TargetOrders.Add(o);
-                NoteFill(match);
+                if (RejectsChild(match, stop))
+                    rejectAccount = match.Account;
+                else
+                {
+                    if (stop) match.StopOrders.Add(o);
+                    else match.TargetOrders.Add(o);
+                    NoteFill(match);
+                    return;
+                }
             }
+
+            if (rejectAccount == null || !IsChangeable(o)) return;
+            try { rejectAccount.Cancel(new[] { o }); }
+            catch (Exception ex) { Print("KcMidTrader leg cancel error: " + ex.Message); }
+        }
+
+        // A removed leg, or a target waiting on an EMA cross, must not pick up an ATM replacement.
+        private static bool RejectsChild(TrackedOrder t, bool stop)
+        {
+            if (t == null) return false;
+            if (stop) return t.StopSource == LegFollow.None || t.StopSource == LegFollow.Macd;
+            return t.TargetSource == LegFollow.None || t.TargetSource == LegFollow.EmaCross || t.TargetSource == LegFollow.Macd;
+        }
+
+        private static void RefreshAtmOwner(TrackedOrder t)
+        {
+            if (t == null || t.AtmOwner != null || t.Order == null) return;
+            try { t.AtmOwner = t.Order.GetOwnerStrategy(); }
+            catch { t.AtmOwner = null; }
         }
 
         private static bool HasChildNamed(TrackedOrder t, string name)
@@ -1886,11 +2465,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             atmSelectorMissLogged = false;
             atmSelector.SelectionChanged += OnAtmSelectionChanged;
+            RememberAtm();
         }
 
         private void OnAtmSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
         {
             if (System.Threading.Interlocked.CompareExchange(ref suppressAtmEvents, 0, 0) != 0) return;
+            RememberAtm();
             if (!UseChartTraderAtm) return;
 
             // The dropdown item is often the live strategy ("Template - 1") or a plain string.
@@ -2038,7 +2619,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         // NF entries are cancelled and resubmitted on the newly selected template.
-        // Checked filled orders get new stop/target prices.
+        // Checked filled orders get new prices only on legs that are still on the ATM.
         private void ApplyAtmChange(string key, NinjaTrader.NinjaScript.AtmStrategy atm)
         {
             if (key == null) return;
@@ -2057,7 +2638,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                         && t.Order.OrderState != OrderState.CancelPending;
                     if (openEntry)
                     {
-                        if (same) continue;
+                        // A market entry has no resting price. Re-submitting it would send a second order at 0.
+                        if (same || t.Order.OrderType == OrderType.Market) continue;
                         double px = t.Order.OrderType == OrderType.Limit ? t.Order.LimitPrice : t.Order.StopPrice;
                         t.PendingReplace = true;
                         t.SwapAtm = true;
@@ -2067,7 +2649,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                         t.FollowAtm = true;
                         toCancel.Add(t);
                     }
-                    else if (t.Order.Filled > 0 && t.SelectedForAtm && !t.Completed && !same)
+                    else if (t.Order.Filled > 0 && t.SelectedForAtm && !t.Completed && !same
+                        && ((t.StopSource == LegFollow.Atm && HasWorkingChild(t.StopOrders))
+                            || (t.TargetSource == LegFollow.Atm && HasWorkingChild(t.TargetOrders))))
                         toReprice.Add(t);
                 }
             }
@@ -2088,7 +2672,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 foreach (TrackedOrder t in toReprice)
                 {
-                    changed += RepriceProtective(t, atm, notes);
+                    changed += RepriceProtective(t, atm, notes,
+                        t.StopSource == LegFollow.Atm, t.TargetSource == LegFollow.Atm);
                     t.AtmName = key;
                 }
             }
@@ -2097,7 +2682,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
 
             string template = key.Length == 0 ? "no ATM" : key;
-            string text = string.Format("{0} NF entr{1} set to {2}. {3} selected stop/target order{4} changed.",
+            string text = string.Format("{0} NF entr{1} set to {2}. {3} selected ATM stop/target order{4} changed.",
                 toCancel.Count, toCancel.Count == 1 ? "y" : "ies", template,
                 changed, changed == 1 ? "" : "s");
             if (atm == null && toReprice.Count > 0)
@@ -2108,8 +2693,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             SyncOrderList();
         }
 
-        private int RepriceProtective(TrackedOrder t, NinjaTrader.NinjaScript.AtmStrategy atm, List<string> notes)
+        private int RepriceProtective(TrackedOrder t, NinjaTrader.NinjaScript.AtmStrategy atm, List<string> notes,
+                                      bool includeStops, bool includeTargets)
         {
+            if (!includeStops && !includeTargets) return 0;
             double fill = t.FillPrice;
             if (fill <= 0 && t.Order != null) fill = t.Order.AverageFillPrice;
             if (fill <= 0)
@@ -2119,12 +2706,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
 
             bool isLong = t.Action == OrderAction.Buy || t.Action == OrderAction.BuyToCover;
-            List<Order> stops;
-            List<Order> targets;
+            List<Order> stops = new List<Order>();
+            List<Order> targets = new List<Order>();
             lock (sync)
             {
-                stops = t.StopOrders.ToList();
-                targets = t.TargetOrders.ToList();
+                if (includeStops) stops = t.StopOrders.ToList();
+                if (includeTargets) targets = t.TargetOrders.ToList();
             }
             if (stops.Count == 0 && targets.Count == 0)
             {
@@ -2165,6 +2752,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return false;
             }
 
+            return SetProtectivePrice(t, order, price, notes);
+        }
+
+        private bool SetProtectivePrice(TrackedOrder t, Order order, double price, List<string> notes)
+        {
+            if (t == null || t.Account == null || order == null || !IsChangeable(order)) return false;
             try
             {
                 if (order.OrderType == OrderType.Limit)
@@ -2189,8 +2782,126 @@ namespace NinjaTrader.NinjaScript.Indicators
             catch (Exception ex)
             {
                 Print("KcMidTrader ATM reprice error: " + ex.Message);
-                notes.Add("Could not change " + (order.Name ?? "order") + ".");
+                if (notes != null) notes.Add("Could not change " + (order.Name ?? "order") + ".");
                 return false;
+            }
+        }
+
+        private static bool HasWorkingChild(List<Order> orders)
+        {
+            if (orders == null) return false;
+            for (int i = 0; i < orders.Count; i++)
+            {
+                Order o = orders[i];
+                if (o != null && (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted
+                    || o.OrderState == OrderState.PartFilled))
+                    return true;
+            }
+            return false;
+        }
+
+        // Long stop and short target stay below the market. Short stop and long target stay above it.
+        private bool ProtectiveOnRestingSide(bool isLong, bool isStop, double price)
+        {
+            double market = lastPrice;
+            if (double.IsNaN(market) || market <= 0)
+            {
+                market = isLong ? lastBid : lastAsk;
+                if (double.IsNaN(market) || market <= 0) market = lastPrice;
+            }
+            if (double.IsNaN(market) || market <= 0) return false;
+            bool below = (isLong && isStop) || (!isLong && !isStop);
+            int cmp = price.ApproxCompare(market);
+            if (cmp == 0) return false;
+            return below ? cmp < 0 : cmp > 0;
+        }
+
+        private void TrackProtective(int barIndex)
+        {
+            List<TrackedOrder> orders;
+            lock (sync) orders = tracked.ToList();
+            foreach (TrackedOrder t in orders)
+            {
+                if (t.Completed || t.Order == null || t.Order.Filled <= 0) continue;
+                if (t.StopSource == LegFollow.Indicator)
+                    ReportFollow(FollowLeg(t, true, barIndex));
+                if (t.TargetSource == LegFollow.Indicator)
+                    ReportFollow(FollowLeg(t, false, barIndex));
+                // EMA cross is closed-bar only, in TrackEmaCrossNow. A forming bar must not open and close the same trade.
+            }
+        }
+
+        private void ReportFollow(string note)
+        {
+            if (!string.IsNullOrEmpty(note)) SetStatus(note);
+        }
+
+        // null means the leg was moved, or it was already at the plot. A string is a pause or miss.
+        private string FollowLeg(TrackedOrder t, bool isStop, int barIndex)
+        {
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind;
+            int plot;
+            lock (sync)
+            {
+                if ((isStop ? t.StopSource : t.TargetSource) != LegFollow.Indicator) return null;
+                ind = isStop ? t.StopIndicator : t.TargetIndicator;
+                plot = isStop ? t.StopPlot : t.TargetPlot;
+            }
+            string which = isStop ? "Stop" : "Target";
+            double raw;
+            if (ind == null || !TryReadSeries(ind, plot, barIndex, out raw))
+            {
+                if (NoteLegFlag(t, isStop, false))
+                    return which + " left in place: its indicator has no value.";
+                return null;
+            }
+
+            double price = Instrument.MasterInstrument.RoundToTickSize(raw);
+            bool isLong = t.Action == OrderAction.Buy || t.Action == OrderAction.BuyToCover;
+            if (!ProtectiveOnRestingSide(isLong, isStop, price))
+            {
+                if (NoteLegFlag(t, isStop, true))
+                    return which + " paused: " + Instrument.MasterInstrument.FormatPrice(price) + " is on the wrong side of the market.";
+                return null;
+            }
+
+            ClearLegFlags(t, isStop);
+            List<Order> children;
+            lock (sync) children = (isStop ? t.StopOrders : t.TargetOrders).ToList();
+            List<string> notes = new List<string>();
+            foreach (Order child in children)
+                SetProtectivePrice(t, child, price, notes);
+            return notes.Count > 0 ? notes[0] : null;
+        }
+
+        private bool NoteLegFlag(TrackedOrder t, bool isStop, bool paused)
+        {
+            bool already;
+            lock (sync)
+            {
+                already = paused
+                    ? (isStop ? t.StopPaused : t.TargetPaused)
+                    : (isStop ? t.StopMissing : t.TargetMissing);
+                if (isStop)
+                {
+                    t.StopPaused = paused;
+                    t.StopMissing = !paused;
+                }
+                else
+                {
+                    t.TargetPaused = paused;
+                    t.TargetMissing = !paused;
+                }
+            }
+            return !already;
+        }
+
+        private void ClearLegFlags(TrackedOrder t, bool isStop)
+        {
+            lock (sync)
+            {
+                if (isStop) { t.StopPaused = false; t.StopMissing = false; }
+                else { t.TargetPaused = false; t.TargetMissing = false; }
             }
         }
 
@@ -2345,6 +3056,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     s.AllChildren = new List<Order>();
                     s.AllChildren.AddRange(t.StopOrders);
                     s.AllChildren.AddRange(t.TargetOrders);
+                    s.AllChildren.AddRange(t.CloseOrders);
                     s.PricedChildren = new List<Order>();
                     foreach (Order c in s.AllChildren)
                     {
@@ -2495,9 +3207,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
                 sig = sb.ToString();
             }
-            if (sig == orderListSig) return;
-            orderListSig = sig;
             if (ChartControl == null) return;
+            if (sig == orderListSig)
+            {
+                ChartControl.Dispatcher.InvokeAsync(UpdateLegButton);
+                return;
+            }
+            orderListSig = sig;
             ChartControl.Dispatcher.InvokeAsync(RefreshOrderList);
         }
 
@@ -2533,6 +3249,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             FillOrderSection(nfListPanel, nf, "No working orders");
             FillOrderSection(filledListPanel, filled, "No filled orders");
             FillOrderSection(doneListPanel, done, "No completed trades");
+            UpdateLegButton();
         }
 
         private void FillOrderSection(System.Windows.Controls.StackPanel panel, List<OrderRow> rows, string empty)
@@ -2602,6 +3319,2475 @@ namespace NinjaTrader.NinjaScript.Indicators
                 foreach (TrackedOrder t in tracked)
                     if (t.Label == label) t.SelectedForAtm = on;
             }
+            UpdateLegButton();
+        }
+
+        private TrackedOrder SoleSelectedFilled()
+        {
+            TrackedOrder only = null;
+            int n = 0;
+            lock (sync)
+            {
+                foreach (TrackedOrder t in tracked)
+                {
+                    if (!t.SelectedForAtm || t.Completed || !IsListedFilled(t)) continue;
+                    n++;
+                    only = t;
+                }
+            }
+            return n == 1 ? only : null;
+        }
+
+        private void UpdateLegButton()
+        {
+            if (legButton == null) return;
+            TrackedOrder only = SoleSelectedFilled();
+            if (only == null)
+            {
+                legButton.Visibility = Visibility.Collapsed;
+                return;
+            }
+            legButton.Visibility = Visibility.Visible;
+            legButton.IsEnabled = true;
+            legButton.ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close either leg when MACD crosses a level.";
+        }
+
+        private void OnLegButtonClick(object sender, RoutedEventArgs e)
+        {
+            DetectKeltner();
+            TrackedOrder t = SoleSelectedFilled();
+            UpdateLegButton();
+            if (t == null || legButton == null || !legButton.IsEnabled) return;
+            ShowLegDialog(t);
+        }
+
+        private bool ShowEmaCrossDialog()
+        {
+            List<KcSource> sources = CollectSources(false, null);
+            List<KcSource> emas = new List<KcSource>();
+            foreach (KcSource k in sources)
+                if (IsEma(k)) emas.Add(k);
+            if (emas.Count < 2)
+            {
+                SetStatusNow("EMA cross needs two EMAs.");
+                return false;
+            }
+
+            bool accepted = false;
+            Window win = new Window
+            {
+                Title = "EMA cross",
+                Owner = chartWindow,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                ResizeMode = ResizeMode.NoResize,
+                SizeToContent = SizeToContent.WidthAndHeight,
+                Width = 460,
+                Background = Brushes.White,
+                ShowInTaskbar = false
+            };
+
+            System.Windows.Controls.StackPanel root = new System.Windows.Controls.StackPanel { Margin = new Thickness(12) };
+            root.Children.Add(new System.Windows.Controls.TextBlock
+            {
+                Text = "Buy opens when EMA A crosses above EMA B. Sell opens when EMA A crosses below EMA B. A cross that is already true does not open or close.",
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                Margin = new Thickness(0, 0, 0, 8)
+            });
+
+            System.Windows.Controls.Grid grid = new System.Windows.Controls.Grid { Margin = new Thickness(0, 4, 0, 4) };
+            grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
+
+            System.Windows.Controls.ComboBox emaA = new System.Windows.Controls.ComboBox { MinWidth = 220, Margin = new Thickness(8, 2, 0, 2) };
+            System.Windows.Controls.ComboBox emaB = new System.Windows.Controls.ComboBox { MinWidth = 220, Margin = new Thickness(8, 2, 0, 2) };
+            bool emaBusy = false;
+            System.Windows.Controls.SelectionChangedEventHandler onEma = delegate
+            {
+                if (emaBusy) return;
+                emaBusy = true;
+                try { SyncExclusiveEmas(emaA, emaB, emas, null, null); }
+                finally { emaBusy = false; }
+            };
+            emaA.SelectionChanged += onEma;
+            emaB.SelectionChanged += onEma;
+            System.Windows.Controls.TextBlock aLabel = EmaLabel("EMA A");
+            System.Windows.Controls.TextBlock bLabel = EmaLabel("EMA B");
+            System.Windows.Controls.Grid.SetRow(aLabel, 0);
+            System.Windows.Controls.Grid.SetRow(emaA, 0);
+            System.Windows.Controls.Grid.SetColumn(emaA, 1);
+            System.Windows.Controls.Grid.SetRow(bLabel, 1);
+            System.Windows.Controls.Grid.SetRow(emaB, 1);
+            System.Windows.Controls.Grid.SetColumn(emaB, 1);
+            grid.Children.Add(aLabel);
+            grid.Children.Add(emaA);
+            grid.Children.Add(bLabel);
+            grid.Children.Add(emaB);
+            emaBusy = true;
+            try { SyncExclusiveEmas(emaA, emaB, emas, crossEmaA, crossEmaB); }
+            finally { emaBusy = false; }
+            root.Children.Add(grid);
+
+            System.Windows.Controls.TextBlock errorText = new System.Windows.Controls.TextBlock
+            {
+                Foreground = new SolidColorBrush(Color.FromRgb(0xA3, 0x24, 0x24)),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0),
+                FontSize = 12
+            };
+            root.Children.Add(errorText);
+
+            System.Windows.Controls.StackPanel buttons = new System.Windows.Controls.StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            System.Windows.Controls.Button confirm = new System.Windows.Controls.Button
+            {
+                Content = "Confirm", Width = 88, Height = 26, Margin = new Thickness(0, 0, 8, 0), IsDefault = true
+            };
+            System.Windows.Controls.Button cancel = new System.Windows.Controls.Button
+            {
+                Content = "Cancel", Width = 88, Height = 26, IsCancel = true
+            };
+            confirm.Click += delegate
+            {
+                FollowPick a = emaA.SelectedItem as FollowPick;
+                FollowPick b = emaB.SelectedItem as FollowPick;
+                if (a == null || b == null || a.Source == null || b.Source == null
+                    || a.Source.Indicator == null || b.Source.Indicator == null)
+                {
+                    errorText.Text = "Choose the two EMAs.";
+                    return;
+                }
+                if (ReferenceEquals(a.Source.Indicator, b.Source.Indicator))
+                {
+                    errorText.Text = "Choose two different EMAs.";
+                    return;
+                }
+                crossEmaA = a.Source.Indicator;
+                crossEmaB = b.Source.Indicator;
+                crossEmaAName = a.Text;
+                crossEmaBName = b.Text;
+                crossConfigured = true;
+                accepted = true;
+                win.DialogResult = true;
+            };
+            buttons.Children.Add(confirm);
+            buttons.Children.Add(cancel);
+            root.Children.Add(buttons);
+            win.Content = root;
+            try { win.ShowDialog(); }
+            catch (Exception ex) { Print("KcMidTrader EMA cross window error: " + ex.Message); }
+            return accepted;
+        }
+
+        private void ShowLegDialog(TrackedOrder t)
+        {
+            if (t == null || t.Completed) return;
+
+            Window win = new Window
+            {
+                Title = "Stop and target",
+                Owner = chartWindow,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                ResizeMode = ResizeMode.NoResize,
+                SizeToContent = SizeToContent.WidthAndHeight,
+                Width = 520,
+                Background = Brushes.White,
+                ShowInTaskbar = false
+            };
+
+            System.Windows.Controls.StackPanel root = new System.Windows.Controls.StackPanel { Margin = new Thickness(12) };
+            List<KcSource> sources = CollectSources(false, null);
+            List<LegDialogRow> rows = new List<LegDialogRow>();
+            rows.Add(BuildLegRow(win, root, "Stop", true, t, sources));
+            rows.Add(BuildLegRow(win, root, "Target", false, t, sources));
+
+            System.Windows.Controls.TextBlock errorText = new System.Windows.Controls.TextBlock
+            {
+                Foreground = new SolidColorBrush(Color.FromRgb(0xA3, 0x24, 0x24)),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0),
+                FontSize = 12
+            };
+            root.Children.Add(errorText);
+
+            System.Windows.Controls.StackPanel buttons = new System.Windows.Controls.StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            System.Windows.Controls.Button confirm = new System.Windows.Controls.Button
+            {
+                Content = "Confirm", Width = 88, Height = 26, Margin = new Thickness(0, 0, 8, 0), IsDefault = true
+            };
+            System.Windows.Controls.Button cancel = new System.Windows.Controls.Button
+            {
+                Content = "Cancel", Width = 88, Height = 26, IsCancel = true
+            };
+            confirm.Click += delegate
+            {
+                string error;
+                try { error = ApplyLegDialog(t, rows); }
+                catch (Exception ex)
+                {
+                    Print("KcMidTrader SL/TP apply error: " + ex.Message);
+                    error = ex.Message;
+                }
+                if (error != null) { errorText.Text = error; return; }
+                win.DialogResult = true;
+            };
+            buttons.Children.Add(confirm);
+            buttons.Children.Add(cancel);
+            root.Children.Add(buttons);
+            win.Content = root;
+            try { win.ShowDialog(); }
+            catch (Exception ex) { Print("KcMidTrader SL/TP window error: " + ex.Message); }
+        }
+
+        private LegDialogRow BuildLegRow(Window owner, System.Windows.Controls.StackPanel root, string caption, bool isStop, TrackedOrder t, List<KcSource> sources)
+        {
+            System.Windows.Controls.Grid grid = new System.Windows.Controls.Grid { Margin = new Thickness(0, 4, 0, 4) };
+            grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(64) });
+            grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
+
+            System.Windows.Controls.TextBlock label = new System.Windows.Controls.TextBlock
+            {
+                Text = caption,
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                FontWeight = FontWeights.Bold
+            };
+            System.Windows.Controls.ComboBox source = new System.Windows.Controls.ComboBox { MinWidth = 180, Margin = new Thickness(0, 0, 8, 0) };
+            System.Windows.Controls.ComboBox band = new System.Windows.Controls.ComboBox { MinWidth = 110, Visibility = Visibility.Collapsed };
+            System.Windows.Controls.Button macdButton = new System.Windows.Controls.Button
+            {
+                Content = "Value", MinWidth = 64, Height = 22, Margin = new Thickness(0, 0, 0, 0),
+                Visibility = Visibility.Collapsed
+            };
+            source.MaxDropDownHeight = 320;
+            source.Items.Add(new FollowPick { Text = "ATM strategy", Kind = FollowKind.Atm });
+            source.Items.Add(new FollowPick { Text = "None", Kind = FollowKind.None });
+
+            List<KcSource> emas = new List<KcSource>();
+            if (!isStop && sources != null)
+            {
+                foreach (KcSource k in sources)
+                    if (IsEma(k)) emas.Add(k);
+                // Keep this above the indicator names so a long list cannot hide it.
+                if (emas.Count >= 2)
+                    source.Items.Add(new FollowPick { Text = "EMA cross", Kind = FollowKind.EmaCross });
+            }
+            if (sources != null)
+                foreach (KcSource k in sources)
+                    source.Items.Add(new FollowPick { Text = k.Label, Source = k, Kind = FollowKind.Indicator });
+
+            System.Windows.Controls.Grid emaPanel = null;
+            System.Windows.Controls.ComboBox emaA = null;
+            System.Windows.Controls.ComboBox emaB = null;
+            bool emaBusy = false;
+            if (emas.Count >= 2)
+            {
+                emaPanel = new System.Windows.Controls.Grid { Margin = new Thickness(64, 0, 0, 4), Visibility = Visibility.Collapsed };
+                emaPanel.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
+                emaPanel.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                emaPanel.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
+                emaPanel.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
+                emaA = new System.Windows.Controls.ComboBox { MinWidth = 180, Margin = new Thickness(8, 2, 0, 2) };
+                emaB = new System.Windows.Controls.ComboBox { MinWidth = 180, Margin = new Thickness(8, 2, 0, 2) };
+                System.Windows.Controls.SelectionChangedEventHandler onEma = delegate
+                {
+                    if (emaBusy) return;
+                    emaBusy = true;
+                    try { SyncExclusiveEmas(emaA, emaB, emas, null, null); }
+                    finally { emaBusy = false; }
+                };
+                emaA.SelectionChanged += onEma;
+                emaB.SelectionChanged += onEma;
+                System.Windows.Controls.TextBlock aLabel = EmaLabel("EMA A");
+                System.Windows.Controls.TextBlock bLabel = EmaLabel("EMA B");
+                System.Windows.Controls.Grid.SetRow(aLabel, 0);
+                System.Windows.Controls.Grid.SetRow(emaA, 0);
+                System.Windows.Controls.Grid.SetColumn(emaA, 1);
+                System.Windows.Controls.Grid.SetRow(bLabel, 1);
+                System.Windows.Controls.Grid.SetRow(emaB, 1);
+                System.Windows.Controls.Grid.SetColumn(emaB, 1);
+                emaPanel.Children.Add(aLabel);
+                emaPanel.Children.Add(emaA);
+                emaPanel.Children.Add(bLabel);
+                emaPanel.Children.Add(emaB);
+            }
+
+            int savedPlot;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase savedInd, savedA, savedB;
+            LegFollow mode;
+            bool savedMacd;
+            double savedMacdLevel;
+            lock (sync)
+            {
+                mode = isStop ? t.StopSource : t.TargetSource;
+                savedInd = isStop ? t.StopIndicator : t.TargetIndicator;
+                savedPlot = isStop ? t.StopPlot : t.TargetPlot;
+                savedA = t.TargetEmaA;
+                savedB = t.TargetEmaB;
+                savedMacd = isStop ? t.StopMacdSet : t.TargetMacdSet;
+                savedMacdLevel = isStop ? t.StopMacdLevel : t.TargetMacdLevel;
+            }
+            LegDialogRow row = new LegDialogRow
+            {
+                IsStop = isStop,
+                SourceBox = source,
+                BandBox = band,
+                EmaABox = emaA,
+                EmaBBox = emaB,
+                EmaPanel = emaPanel,
+                MacdButton = macdButton
+            };
+            if (mode == LegFollow.Macd && savedMacd && savedInd != null)
+            {
+                row.MacdSet = true;
+                row.MacdLevel = savedMacdLevel;
+                row.MacdIndicator = savedInd;
+            }
+            source.SelectionChanged += delegate
+            {
+                if (suppressLegDialog) return;
+                FollowPick pick = source.SelectedItem as FollowPick;
+                if (pick != null && pick.Kind == FollowKind.Indicator && IsMacd(pick.Source))
+                {
+                    if (row.MacdPromptOpen) return;
+                    int picked = source.SelectedIndex;
+                    row.MacdPromptOpen = true;
+                    source.Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            if (source.SelectedIndex != picked) return;
+                            FollowPick now = source.SelectedItem as FollowPick;
+                            if (now == null || now.Kind != FollowKind.Indicator || !IsMacd(now.Source)) return;
+                            double chosen;
+                            if (!PromptLegMacd(owner, t, row, now, savedInd, savedMacd, savedMacdLevel, mode, out chosen))
+                            {
+                                suppressLegDialog = true;
+                                try { source.SelectedIndex = row.PriorIndex; }
+                                finally { suppressLegDialog = false; }
+                                ShowLegChoice(source, band, emaPanel, savedPlot, macdButton, row.MacdSet, row.MacdLevel);
+                                return;
+                            }
+                            row.MacdSet = true;
+                            row.MacdLevel = chosen;
+                            row.MacdIndicator = now.Source.Indicator;
+                            row.PriorIndex = source.SelectedIndex;
+                            ShowLegChoice(source, band, emaPanel, savedPlot, macdButton, row.MacdSet, row.MacdLevel);
+                        }
+                        finally { row.MacdPromptOpen = false; }
+                    }), System.Windows.Threading.DispatcherPriority.Background);
+                    return;
+                }
+                row.PriorIndex = source.SelectedIndex;
+                ShowLegChoice(source, band, emaPanel, savedPlot, macdButton, row.MacdSet, row.MacdLevel);
+            };
+            macdButton.Click += delegate
+            {
+                FollowPick pick = source.SelectedItem as FollowPick;
+                if (pick == null || pick.Kind != FollowKind.Indicator || !IsMacd(pick.Source)) return;
+                double chosen;
+                if (!PromptLegMacd(owner, t, row, pick, savedInd, savedMacd, savedMacdLevel, mode, out chosen)) return;
+                row.MacdSet = true;
+                row.MacdLevel = chosen;
+                row.MacdIndicator = pick.Source.Indicator;
+                ShowLegChoice(source, band, emaPanel, savedPlot, macdButton, row.MacdSet, row.MacdLevel);
+            };
+
+            int sel = 0;
+            if (mode == LegFollow.None)
+                sel = 1;
+            else if (!isStop && mode == LegFollow.EmaCross)
+                sel = IndexOfKind(source, FollowKind.EmaCross);
+            else if ((mode == LegFollow.Indicator || mode == LegFollow.Macd) && savedInd != null)
+                sel = IndexOfIndicator(source, savedInd);
+            if (sel < 0) sel = 0;
+
+            suppressLegDialog = true;
+            try
+            {
+                source.SelectedIndex = sel;
+                row.PriorIndex = sel;
+                ShowLegChoice(source, band, emaPanel, savedPlot, macdButton, row.MacdSet, row.MacdLevel);
+                if (emaA != null)
+                {
+                    emaBusy = true;
+                    try { SyncExclusiveEmas(emaA, emaB, emas, savedA, savedB); }
+                    finally { emaBusy = false; }
+                }
+            }
+            finally { suppressLegDialog = false; }
+
+            System.Windows.Controls.StackPanel side = new System.Windows.Controls.StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal
+            };
+            side.Children.Add(band);
+            side.Children.Add(macdButton);
+            System.Windows.Controls.Grid.SetColumn(label, 0);
+            System.Windows.Controls.Grid.SetColumn(source, 1);
+            System.Windows.Controls.Grid.SetColumn(side, 2);
+            grid.Children.Add(label);
+            grid.Children.Add(source);
+            grid.Children.Add(side);
+            root.Children.Add(grid);
+            if (emaPanel != null) root.Children.Add(emaPanel);
+            return row;
+        }
+
+        // Stored level when this leg already follows this MACD. Otherwise the suggestion for this side.
+        private bool PromptLegMacd(Window owner, TrackedOrder t, LegDialogRow row, FollowPick pick,
+                                   NinjaTrader.Gui.NinjaScript.IndicatorRenderBase savedInd, bool savedMacd, double savedLevel,
+                                   LegFollow mode, out double level)
+        {
+            level = 0;
+            if (t == null || pick == null || pick.Source == null || pick.Source.Indicator == null) return false;
+            bool sameSession = row.MacdSet && row.MacdIndicator != null
+                && ReferenceEquals(row.MacdIndicator, pick.Source.Indicator);
+            bool sameSaved = mode == LegFollow.Macd && savedMacd && savedInd != null
+                && ReferenceEquals(savedInd, pick.Source.Indicator);
+            double suggested = 0;
+            string reason = null;
+            bool got = false;
+            bool isLong = IsBuyAction(t.Action);
+            try { got = TrySuggestLegMacd(pick.Source.Indicator, isLong, row.IsStop, out suggested, out reason); }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader MACD suggestion error: " + ex.Message);
+                got = false;
+            }
+            string suggestion = got
+                ? "Suggested: " + FormatMacd(suggested) + ". " + reason + "."
+                : "MACD has no closed value yet. Type a level.";
+            string prefill;
+            if (sameSession) prefill = FormatMacd(row.MacdLevel);
+            else if (sameSaved) prefill = FormatMacd(savedLevel);
+            else prefill = got ? FormatMacd(suggested) : "";
+            string intro = MacdHitSign(isLong, row.IsStop) < 0
+                ? "This leg closes when the MACD line crosses down through the level. A level that is already crossed does not close until the line leaves it and crosses again."
+                : "This leg closes when the MACD line crosses up through the level. A level that is already crossed does not close until the line leaves it and crosses again.";
+            return ShowMacdLevelDialog(owner, row.IsStop ? "MACD stop" : "MACD target", intro, prefill, suggestion, out level);
+        }
+
+        private static System.Windows.Controls.TextBlock EmaLabel(string text)
+        {
+            return new System.Windows.Controls.TextBlock
+            {
+                Text = text,
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                Margin = new Thickness(0, 2, 0, 2)
+            };
+        }
+
+        private static int IndexOfKind(System.Windows.Controls.ComboBox box, FollowKind kind)
+        {
+            for (int i = 0; i < box.Items.Count; i++)
+            {
+                FollowPick pick = box.Items[i] as FollowPick;
+                if (pick != null && pick.Kind == kind) return i;
+            }
+            return -1;
+        }
+
+        // EMA A hides the EMA chosen in B, and EMA B hides the EMA chosen in A.
+        private static void SyncExclusiveEmas(System.Windows.Controls.ComboBox emaA, System.Windows.Controls.ComboBox emaB,
+                                               List<KcSource> emas,
+                                               NinjaTrader.Gui.NinjaScript.IndicatorRenderBase preferA,
+                                               NinjaTrader.Gui.NinjaScript.IndicatorRenderBase preferB)
+        {
+            if (preferA == null) preferA = SelectedEma(emaA);
+            if (preferB == null) preferB = SelectedEma(emaB);
+            if (preferA != null && ReferenceEquals(preferA, preferB)) preferB = null;
+            FillEmaBox(emaA, emas, preferB, preferA);
+            FillEmaBox(emaB, emas, SelectedEma(emaA), preferB);
+        }
+
+        private static NinjaTrader.Gui.NinjaScript.IndicatorRenderBase SelectedEma(System.Windows.Controls.ComboBox box)
+        {
+            FollowPick pick = box == null ? null : box.SelectedItem as FollowPick;
+            return pick != null && pick.Source != null ? pick.Source.Indicator : null;
+        }
+
+        private static void FillEmaBox(System.Windows.Controls.ComboBox box, List<KcSource> emas,
+                                        NinjaTrader.Gui.NinjaScript.IndicatorRenderBase exclude,
+                                        NinjaTrader.Gui.NinjaScript.IndicatorRenderBase prefer)
+        {
+            if (box == null) return;
+            box.Items.Clear();
+            if (emas != null)
+            {
+                foreach (KcSource k in emas)
+                {
+                    if (k == null || k.Indicator == null) continue;
+                    if (exclude != null && ReferenceEquals(k.Indicator, exclude)) continue;
+                    box.Items.Add(new FollowPick { Text = k.Label, Source = k, Kind = FollowKind.Indicator });
+                }
+            }
+            int sel = IndexOfIndicator(box, prefer);
+            box.SelectedIndex = sel >= 0 ? sel : (box.Items.Count > 0 ? 0 : -1);
+        }
+
+        private static int IndexOfIndicator(System.Windows.Controls.ComboBox box, NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
+        {
+            if (box == null || ind == null) return -1;
+            for (int i = 0; i < box.Items.Count; i++)
+            {
+                FollowPick pick = box.Items[i] as FollowPick;
+                if (pick != null && pick.Source != null && ReferenceEquals(pick.Source.Indicator, ind))
+                    return i;
+            }
+            return -1;
+        }
+
+        private static void ShowLegChoice(System.Windows.Controls.ComboBox source, System.Windows.Controls.ComboBox band,
+                                           System.Windows.Controls.Panel emaPanel, int savedPlot,
+                                           System.Windows.Controls.Button macdButton, bool macdSet, double macdLevel)
+        {
+            FollowPick pick = source.SelectedItem as FollowPick;
+            bool ema = pick != null && pick.Kind == FollowKind.EmaCross;
+            bool macd = pick != null && pick.Kind == FollowKind.Indicator && IsMacd(pick.Source);
+            if (emaPanel != null)
+                emaPanel.Visibility = ema ? Visibility.Visible : Visibility.Collapsed;
+            if (macdButton != null)
+            {
+                macdButton.Visibility = macd ? Visibility.Visible : Visibility.Collapsed;
+                macdButton.Content = macd && macdSet ? FormatMacd(macdLevel) : "Value";
+            }
+            if (ema || macd)
+            {
+                band.Visibility = Visibility.Collapsed;
+                return;
+            }
+            if (macdButton != null) macdButton.Visibility = Visibility.Collapsed;
+            FillBandBox(band, pick != null && pick.Kind == FollowKind.Indicator ? pick.Source : null, savedPlot);
+        }
+
+        // The indicator itself is an EMA. A Keltner or other study that only uses an EMA input is not.
+        private static bool IsEma(KcSource src)
+        {
+            if (src == null || src.Indicator == null) return false;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind = src.Indicator;
+            if (IsEmaIdentifier(ind.GetType().Name) || IsEmaIdentifier(ind.Name)) return true;
+            return IsEmaIdentifier(SafeDisplayName(ind));
+        }
+
+        private static bool IsEmaIdentifier(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string head = text.Trim();
+            int paren = head.IndexOf('(');
+            if (paren >= 0) head = head.Substring(0, paren).Trim();
+            if (head.IndexOf("exponential", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+
+            int i = 0;
+            while (i < head.Length)
+            {
+                while (i < head.Length && !char.IsLetter(head[i])) i++;
+                int start = i;
+                while (i < head.Length && char.IsLetter(head[i])) i++;
+                if (start == i) break;
+                string token = head.Substring(start, i - start);
+                if (token.Equals("EMA", StringComparison.OrdinalIgnoreCase)
+                    || token.Equals("DEMA", StringComparison.OrdinalIgnoreCase)
+                    || token.Equals("TEMA", StringComparison.OrdinalIgnoreCase)
+                    || token.Equals("ZLEMA", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        // The indicator itself is a MACD, including MACDVariation. A study that only takes MACD as an input is not.
+        private static bool IsMacd(KcSource src)
+        {
+            if (src == null || src.IsEmaCross || src.Indicator == null) return false;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind = src.Indicator;
+            if (IsMacdIdentifier(ind.GetType().Name) || IsMacdIdentifier(ind.Name)) return true;
+            return IsMacdIdentifier(SafeDisplayName(ind));
+        }
+
+        private static bool IsMacdIdentifier(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string head = text.Trim();
+            int paren = head.IndexOf('(');
+            if (paren >= 0) head = head.Substring(0, paren).Trim();
+            int i = 0;
+            while (i < head.Length)
+            {
+                while (i < head.Length && !char.IsLetter(head[i])) i++;
+                int start = i;
+                while (i < head.Length && char.IsLetter(head[i])) i++;
+                if (start == i) break;
+                string token = head.Substring(start, i - start);
+                // MACDVariation and the stock MACD both count. A parameter named MACD does not,
+                // because the text after the first "(" was already removed.
+                if (token.Equals("MACD", StringComparison.OrdinalIgnoreCase)
+                    || token.StartsWith("MACD", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        // Plot named MACD. Avg is the signal and Diff is the histogram, so neither is the level.
+        private static int FindMacdPlot(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
+        {
+            if (ind == null) return -1;
+            int plots = ind.Plots == null ? 0 : ind.Plots.Length;
+            for (int i = 0; i < plots; i++)
+            {
+                string pn = ind.Plots[i] != null ? ind.Plots[i].Name : null;
+                if (!string.IsNullOrEmpty(pn) && pn.Equals("MACD", StringComparison.OrdinalIgnoreCase))
+                    return i;
+            }
+            int n = ind.Values == null ? 0 : ind.Values.Length;
+            return (n > 0 || plots > 0) ? 0 : -1;
+        }
+
+        private static string FormatMacd(double value)
+        {
+            return value.ToString("0.####", CultureInfo.InvariantCulture);
+        }
+
+        // Oscillator values are not prices: zero and negatives are valid.
+        private bool TryReadOscillator(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, int plot, int bar, out double value)
+        {
+            value = double.NaN;
+            if (ind == null || plot < 0 || bar < 0) return false;
+            try
+            {
+                if (ind.Values == null || plot >= ind.Values.Length) return false;
+                Series<double> ser = ind.Values[plot];
+                if (bar >= ser.Count || !ser.IsValidDataPointAt(bar)) return false;
+                value = ser.GetValueAt(bar);
+                return !double.IsNaN(value) && !double.IsInfinity(value);
+            }
+            catch { return false; }
+        }
+
+        private int ClosedBar()
+        {
+            return CurrentBar > 0 ? CurrentBar - 1 : -1;
+        }
+
+        // +1 above the level, -1 below, 0 equal.
+        private bool TryMacdSign(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, double level, int bar, out int sign)
+        {
+            sign = 0;
+            double value;
+            int plot = FindMacdPlot(ind);
+            if (!TryReadOscillator(ind, plot, bar, out value)) return false;
+            sign = value.ApproxCompare(level);
+            return true;
+        }
+
+        // Long stop and short target are hit from above. Long target and short stop are hit from below.
+        private static int MacdHitSign(bool isLong, bool isStop)
+        {
+            bool below = (isLong && isStop) || (!isLong && !isStop);
+            return below ? -1 : 1;
+        }
+
+        // Closed bars only, oldest first. At most 78 values.
+        private bool ReadMacdHistory(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, out List<double> vals)
+        {
+            vals = null;
+            int plot = FindMacdPlot(ind);
+            int end = ClosedBar();
+            if (plot < 0 || end < 0) return false;
+            List<double> list = new List<double>();
+            for (int b = end; b >= 0 && list.Count < 78; b--)
+            {
+                double v;
+                if (!TryReadOscillator(ind, plot, b, out v)) break;
+                list.Add(v);
+            }
+            if (list.Count == 0) return false;
+            list.Reverse();
+            vals = list;
+            return true;
+        }
+
+        // Track entry. Rising line: nearest swing high above it. Falling line: nearest swing low below it.
+        // Then zero when zero is on that side, then half the lookback range.
+        private bool TrySuggestMacdLevel(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind,
+                                          out double level, out string reason)
+        {
+            level = 0;
+            reason = null;
+            List<double> vals;
+            if (!ReadMacdHistory(ind, out vals)) return false;
+
+            int last = vals.Count - 1;
+            double current = vals[last];
+            bool wantAbove = last >= 1 && current >= vals[last - 1];
+            if (TryNearestSwing(vals, current, wantAbove, false, out level))
+            {
+                reason = wantAbove
+                    ? "Nearest MACD swing high above the line"
+                    : "Nearest MACD swing low below the line";
+                return true;
+            }
+
+            int zeroSide = 0d.ApproxCompare(current);
+            if ((wantAbove && zeroSide > 0) || (!wantAbove && zeroSide < 0))
+            {
+                level = 0;
+                reason = "Zero line";
+                return true;
+            }
+
+            double range = MacdRange(vals);
+            if (range > 0)
+            {
+                level = wantAbove ? current + range / 2.0 : current - range / 2.0;
+                reason = "Half the recent MACD range";
+                return true;
+            }
+
+            level = current;
+            reason = "Current MACD";
+            return true;
+        }
+
+        // Filled stop or target. The side of zero decides whether zero itself is the degradation.
+        private bool TrySuggestLegMacd(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, bool isLong, bool isStop,
+                                       out double level, out string reason)
+        {
+            level = 0;
+            reason = null;
+            List<double> vals;
+            if (!ReadMacdHistory(ind, out vals)) return false;
+            double current = vals[vals.Count - 1];
+            int vsZero = current.ApproxCompare(0);
+
+            bool wantHigh;
+            bool betweenZero;
+            bool fallbackZero;
+            if (vsZero == 0)
+            {
+                bool lowSide = (isLong && isStop) || (!isLong && !isStop);
+                wantHigh = !lowSide;
+                betweenZero = false;
+                fallbackZero = false;
+            }
+            else if (isLong && vsZero > 0)
+            {
+                wantHigh = !isStop;
+                betweenZero = isStop;
+                fallbackZero = isStop;
+            }
+            else if (isLong)
+            {
+                wantHigh = !isStop;
+                betweenZero = !isStop;
+                fallbackZero = !isStop;
+            }
+            else if (vsZero < 0)
+            {
+                wantHigh = isStop;
+                betweenZero = isStop;
+                fallbackZero = isStop;
+            }
+            else
+            {
+                wantHigh = isStop;
+                betweenZero = !isStop;
+                fallbackZero = !isStop;
+            }
+
+            if (TryNearestSwing(vals, current, wantHigh, betweenZero, out level))
+            {
+                reason = wantHigh
+                    ? "Nearest MACD swing high above the line"
+                    : "Nearest MACD swing low below the line";
+                return true;
+            }
+            if (fallbackZero)
+            {
+                level = 0;
+                reason = "Zero line";
+                return true;
+            }
+            double range = MacdRange(vals);
+            if (range <= 0) return false;
+            level = wantHigh ? current + range / 2.0 : current - range / 2.0;
+            reason = "Half the recent MACD range";
+            return true;
+        }
+
+        private static double MacdRange(List<double> vals)
+        {
+            double hi = vals[0], lo = vals[0];
+            for (int i = 1; i < vals.Count; i++)
+            {
+                if (vals[i] > hi) hi = vals[i];
+                if (vals[i] < lo) lo = vals[i];
+            }
+            return hi - lo;
+        }
+
+        // betweenZero keeps only swings that sit between the line and zero, including zero.
+        private static bool TryNearestSwing(List<double> vals, double current, bool wantHigh, bool betweenZero, out double level)
+        {
+            level = 0;
+            int last = vals.Count - 1;
+            double best = 0;
+            int bestBar = -1;
+            bool found = false;
+            for (int i = 2; i <= last - 2; i++)
+            {
+                double v = vals[i];
+                bool high = v > vals[i - 1] && v > vals[i - 2] && v > vals[i + 1] && v > vals[i + 2];
+                bool low = v < vals[i - 1] && v < vals[i - 2] && v < vals[i + 1] && v < vals[i + 2];
+                if (wantHigh && !high) continue;
+                if (!wantHigh && !low) continue;
+                if (wantHigh ? v.ApproxCompare(current) <= 0 : v.ApproxCompare(current) >= 0) continue;
+                if (betweenZero)
+                {
+                    if (wantHigh && v.ApproxCompare(0) > 0) continue;
+                    if (!wantHigh && v.ApproxCompare(0) < 0) continue;
+                }
+                double dist = Math.Abs(v - current);
+                if (!found || dist < Math.Abs(best - current) || (dist == Math.Abs(best - current) && i > bestBar))
+                {
+                    found = true;
+                    best = v;
+                    bestBar = i;
+                }
+            }
+            if (!found) return false;
+            level = best;
+            return true;
+        }
+
+        private bool ShowMacdLevelDialog(Window owner, string title, string intro, string prefill, string suggestion, out double level)
+        {
+            level = 0;
+            bool accepted = false;
+            double chosen = 0;
+            Window win = null;
+            try
+            {
+            win = new Window
+            {
+                Title = title,
+                WindowStartupLocation = owner != null ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen,
+                ResizeMode = ResizeMode.NoResize,
+                SizeToContent = SizeToContent.Height,
+                Width = 360,
+                MaxWidth = 360,
+                Background = Brushes.White,
+                ShowInTaskbar = false
+            };
+            if (owner != null) win.Owner = owner;
+
+            System.Windows.Controls.StackPanel root = new System.Windows.Controls.StackPanel { Margin = new Thickness(12) };
+            root.Children.Add(new System.Windows.Controls.TextBlock
+            {
+                Text = intro,
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 336,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                Margin = new Thickness(0, 0, 0, 8)
+            });
+
+            System.Windows.Controls.TextBox box = new System.Windows.Controls.TextBox
+            {
+                Text = prefill ?? "",
+                MinWidth = 220,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            root.Children.Add(box);
+            root.Children.Add(new System.Windows.Controls.TextBlock
+            {
+                Text = suggestion ?? "",
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                FontSize = 12,
+                Margin = new Thickness(0, 0, 0, 4)
+            });
+
+            System.Windows.Controls.TextBlock errorText = new System.Windows.Controls.TextBlock
+            {
+                Foreground = new SolidColorBrush(Color.FromRgb(0xA3, 0x24, 0x24)),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0),
+                FontSize = 12
+            };
+            root.Children.Add(errorText);
+
+            System.Windows.Controls.StackPanel buttons = new System.Windows.Controls.StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            System.Windows.Controls.Button confirm = new System.Windows.Controls.Button
+            {
+                Content = "Confirm", Width = 88, Height = 26, Margin = new Thickness(0, 0, 8, 0), IsDefault = true
+            };
+            System.Windows.Controls.Button cancel = new System.Windows.Controls.Button
+            {
+                Content = "Cancel", Width = 88, Height = 26, IsCancel = true
+            };
+            confirm.Click += delegate
+            {
+                string text = (box.Text ?? "").Trim();
+                double parsed;
+                if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed)
+                    && !double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out parsed))
+                {
+                    errorText.Text = "Enter a MACD level.";
+                    return;
+                }
+                if (double.IsNaN(parsed) || double.IsInfinity(parsed))
+                {
+                    errorText.Text = "Enter a MACD level.";
+                    return;
+                }
+                chosen = parsed;
+                accepted = true;
+                win.DialogResult = true;
+            };
+            buttons.Children.Add(confirm);
+            buttons.Children.Add(cancel);
+            root.Children.Add(buttons);
+            win.Content = root;
+            bool rendered = false;
+            win.ContentRendered += delegate { rendered = true; };
+            win.Loaded += delegate
+            {
+                win.Activate();
+                box.Focus();
+                box.SelectAll();
+            };
+            Mouse.Capture(null);
+            win.ShowDialog();
+            // The Track popup can close the first window before it paints. One more open stays up.
+            if (!rendered && !accepted)
+            {
+                Mouse.Capture(null);
+                win.Content = null;
+                Window again = new Window
+                {
+                    Title = title,
+                    WindowStartupLocation = owner != null ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen,
+                    ResizeMode = ResizeMode.NoResize,
+                    SizeToContent = SizeToContent.Height,
+                    Width = 360,
+                    MaxWidth = 360,
+                    Background = Brushes.White,
+                    ShowInTaskbar = false,
+                    Content = root
+                };
+                if (owner != null) again.Owner = owner;
+                again.Loaded += delegate
+                {
+                    again.Activate();
+                    box.Focus();
+                    box.SelectAll();
+                };
+                win = again;
+                win.ShowDialog();
+            }
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader MACD window error: " + ex.Message);
+                SetStatusNow("MACD window could not open. " + ex.Message);
+                return false;
+            }
+            if (!accepted) return false;
+            level = chosen;
+            return true;
+        }
+
+        private bool PromptTrackMacd(KcSource pick, out double level)
+        {
+            level = 0;
+            if (pick == null || pick.Indicator == null) return false;
+            double suggested = 0;
+            string reason = null;
+            bool got = false;
+            try { got = TrySuggestMacdLevel(pick.Indicator, out suggested, out reason); }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader MACD suggestion error: " + ex.Message);
+                got = false;
+            }
+            string prefill = macdConfigured && !double.IsNaN(macdLevel)
+                ? FormatMacd(macdLevel)
+                : (got ? FormatMacd(suggested) : "");
+            string line = got
+                ? "Suggested: " + FormatMacd(suggested) + ". " + reason + "."
+                : "MACD has no closed value yet. Type a level.";
+            return ShowMacdLevelDialog(
+                chartWindow,
+                "MACD level",
+                "The order price is the Keltner midline.\n"
+                + "Buy is sent when the MACD line crosses above this level.\n"
+                + "Sell is sent when it crosses below.\n"
+                + "A cross that is already true does not send the order.\n"
+                + "A buy above the market and a sell below it wait for the same cross, then follow the midline.",
+                prefill, line, out level);
+        }
+
+        private static void FillBandBox(System.Windows.Controls.ComboBox band, KcSource src, int prefer)
+        {
+            band.Items.Clear();
+            if (src == null)
+            {
+                band.Visibility = Visibility.Collapsed;
+                return;
+            }
+            List<int> plots = new List<int>();
+            List<string> names = new List<string>();
+            CollectPlots(src, plots, names);
+            if (names.Count == 0)
+            {
+                band.Visibility = Visibility.Collapsed;
+                return;
+            }
+            int sel = 0;
+            for (int i = 0; i < names.Count; i++)
+            {
+                band.Items.Add(new BandPick { Text = names[i], Plot = plots[i] });
+                if (plots[i] == prefer) sel = i;
+            }
+            band.SelectedIndex = sel;
+            band.Visibility = names.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private string ApplyLegDialog(TrackedOrder t, List<LegDialogRow> rows)
+        {
+            if (t == null || t.Completed) return "That order is already closed.";
+            LegDialogRow stopRow = null;
+            LegDialogRow targetRow = null;
+            foreach (LegDialogRow row in rows)
+            {
+                if (row.IsStop) stopRow = row;
+                else targetRow = row;
+            }
+            if (stopRow == null || targetRow == null) return "Choose a stop and a target.";
+
+            FollowPick stopPick = stopRow.SourceBox.SelectedItem as FollowPick;
+            FollowPick targetPick = targetRow.SourceBox.SelectedItem as FollowPick;
+            if (stopPick == null || targetPick == null) return "Choose a stop and a target.";
+            if (stopPick.Kind == FollowKind.EmaCross) return "EMA cross applies to the target.";
+
+            string error = ValidateLegChoice(t, stopRow, stopPick);
+            if (error != null) return error;
+            error = ValidateLegChoice(t, targetRow, targetPick);
+            if (error != null) return error;
+
+            bool stopMacd = IsMacdFollow(stopPick);
+            bool targetMacd = IsMacdFollow(targetPick);
+            bool cancelStop = stopPick.Kind == FollowKind.None || stopMacd;
+            bool cancelTarget = targetPick.Kind == FollowKind.None || targetPick.Kind == FollowKind.EmaCross || targetMacd;
+            AttachWorkingLegs(t, true);
+            AttachWorkingLegs(t, false);
+            lock (sync)
+            {
+                if (cancelStop) t.Relink.RemoveAll(h => h.IsStop);
+                if (cancelTarget) t.Relink.RemoveAll(h => !h.IsStop);
+            }
+            if (cancelStop && !cancelTarget) ArmRelink(t, false);
+            if (cancelTarget && !cancelStop) ArmRelink(t, true);
+
+            LegFollow prevStop, prevTarget;
+            lock (sync)
+            {
+                prevStop = t.StopSource;
+                prevTarget = t.TargetSource;
+            }
+            // Mark the leg removed before the cancel so an ATM replacement is not adopted.
+            if (cancelStop) SetRejectSource(t, true);
+            if (cancelTarget) SetRejectSource(t, false);
+
+            int stopCount = 0;
+            int targetCount = 0;
+            if (cancelStop)
+            {
+                string err;
+                stopCount = CancelResolvedLegs(t, true, out err);
+                if (err != null)
+                {
+                    RestoreLegSource(t, true, prevStop);
+                    if (cancelTarget) RestoreLegSource(t, false, prevTarget);
+                    return err;
+                }
+            }
+            if (cancelTarget)
+            {
+                string err;
+                targetCount = CancelResolvedLegs(t, false, out err);
+                if (err != null)
+                {
+                    RestoreLegSource(t, false, prevTarget);
+                    if (cancelStop) SetLegNone(t, true);
+                    return err;
+                }
+            }
+
+            List<string> parts = new List<string>();
+            AddRemovedStatus(parts,
+                stopPick.Kind == FollowKind.None,
+                targetPick.Kind == FollowKind.None,
+                stopCount, targetCount);
+
+            error = ApplyKeptLeg(t, stopRow, stopPick, parts);
+            if (error != null) return error;
+            error = ApplyKeptLeg(t, targetRow, targetPick, parts);
+            if (error != null) return error;
+            if (parts.Count > 0) SetStatusNow(string.Join(" ", parts));
+            return null;
+        }
+
+        private static void AddRemovedStatus(List<string> parts, bool stopNone, bool targetNone, int stops, int targets)
+        {
+            if (!stopNone && !targetNone) return;
+            if (stopNone && targetNone)
+            {
+                if (stops > 0 && targets > 0)
+                    parts.Add("Stop and target removed. The position stays open.");
+                else if (stops > 0)
+                    parts.Add("Stop removed. No working target was found. The position stays open.");
+                else if (targets > 0)
+                    parts.Add("No working stop was found. Target removed. The position stays open.");
+                else
+                    parts.Add("No working stop or target was found. The position stays open.");
+                return;
+            }
+            if (stopNone)
+                parts.Add(stops > 0
+                    ? "Stop removed. The position stays open."
+                    : "No working stop was found. The position stays open.");
+            if (targetNone)
+                parts.Add(targets > 0
+                    ? "Target removed. The position stays open."
+                    : "No working target was found. The position stays open.");
+        }
+
+        private string ValidateLegChoice(TrackedOrder t, LegDialogRow row, FollowPick pick)
+        {
+            if (pick.Kind == FollowKind.None) return null;
+            if (pick.Kind == FollowKind.EmaCross)
+            {
+                FollowPick a = row.EmaABox == null ? null : row.EmaABox.SelectedItem as FollowPick;
+                FollowPick b = row.EmaBBox == null ? null : row.EmaBBox.SelectedItem as FollowPick;
+                if (a == null || b == null || a.Source == null || b.Source == null || a.Source.Indicator == null || b.Source.Indicator == null)
+                    return "Choose the two EMAs.";
+                if (ReferenceEquals(a.Source.Indicator, b.Source.Indicator))
+                    return "Choose two different EMAs.";
+                return null;
+            }
+            if (pick.Kind == FollowKind.Indicator && IsMacd(pick.Source))
+            {
+                if (!row.MacdSet) return "Enter a MACD level for the " + (row.IsStop ? "stop" : "target") + ".";
+                return null;
+            }
+            if (pick.Kind == FollowKind.Indicator)
+            {
+                if (pick.Source == null || (row.BandBox.SelectedItem as BandPick) == null)
+                    return "Choose a band for " + pick.Text + ".";
+                bool working;
+                lock (sync) working = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+                if (!working)
+                {
+                    string placed = PreviewProtective(t, row.IsStop, pick.Source, (row.BandBox.SelectedItem as BandPick).Plot);
+                    if (placed != null) return placed;
+                }
+                return null;
+            }
+
+            NinjaTrader.NinjaScript.AtmStrategy selected = SelectedAtm();
+            string selectedKey = selected == null ? null : AtmTemplateKey(selected);
+            if (selected == null || string.IsNullOrEmpty(selectedKey))
+                return "Select an ATM strategy in Chart Trader to use a fixed stop or target.";
+            bool live;
+            lock (sync) live = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+            if (!live)
+            {
+                string placed = PreviewAtmLeg(t, row.IsStop, selected);
+                if (placed != null) return placed;
+            }
+            return null;
+        }
+
+        private string ApplyKeptLeg(TrackedOrder t, LegDialogRow row, FollowPick pick, List<string> parts)
+        {
+            string which = row.IsStop ? "Stop" : "Target";
+            if (pick.Kind == FollowKind.None)
+            {
+                SetLegNone(t, row.IsStop);
+                return null;
+            }
+            if (pick.Kind == FollowKind.EmaCross)
+            {
+                FollowPick a = row.EmaABox.SelectedItem as FollowPick;
+                FollowPick b = row.EmaBBox.SelectedItem as FollowPick;
+                lock (sync)
+                {
+                    t.TargetSource = LegFollow.EmaCross;
+                    t.TargetIndicator = null;
+                    t.TargetEmaA = a.Source.Indicator;
+                    t.TargetEmaB = b.Source.Indicator;
+                    t.TargetEmaSign = 0;
+                    t.TargetCrossSent = false;
+                    t.TargetCrossPending = false;
+                    t.TargetPaused = false;
+                    t.TargetMissing = false;
+                    t.TargetMacdSet = false;
+                }
+                parts.Add("Target will close when " + a.Text + " crosses " + b.Text + ". The position stays open until then.");
+                return null;
+            }
+            if (IsMacdFollow(pick))
+            {
+                if (!row.MacdSet || pick.Source == null || pick.Source.Indicator == null)
+                    return "Enter a MACD level for the " + which.ToLower() + ".";
+                bool isLong = IsBuyAction(t.Action);
+                int hit = MacdHitSign(isLong, row.IsStop);
+                int sign = 0;
+                int bar = ClosedBar();
+                bool known = bar >= 0 && TryMacdSign(pick.Source.Indicator, row.MacdLevel, bar, out sign);
+                int stored = int.MinValue;
+                if (known)
+                {
+                    bool already = hit < 0 ? sign <= 0 : sign >= 0;
+                    stored = already ? hit : sign;
+                }
+                lock (sync) { AssignMacdLeg(t, row.IsStop, pick.Source.Indicator, row.MacdLevel, stored); }
+                parts.Add(which + " will close when MACD crosses " + FormatMacd(row.MacdLevel) + ". The position stays open until then.");
+                return null;
+            }
+            if (pick.Kind == FollowKind.Atm)
+            {
+                bool working;
+                lock (sync) working = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+                if (working)
+                {
+                    NinjaTrader.NinjaScript.AtmStrategy atm = SelectedAtm();
+                    string key = atm == null ? null : AtmTemplateKey(atm);
+                    if (atm == null || string.IsNullOrEmpty(key))
+                        return "Select an ATM strategy in Chart Trader to use a fixed stop or target.";
+                    List<string> notes = new List<string>();
+                    RepriceProtective(t, atm, notes, row.IsStop, !row.IsStop);
+                    if (notes.Count > 0) return notes[0];
+                    lock (sync)
+                    {
+                        AssignAtmLeg(t, row.IsStop, key, atm);
+                    }
+                    parts.Add(which + " left on the ATM strategy.");
+                    return null;
+                }
+                string error = PlaceAtmLeg(t, row.IsStop);
+                if (error != null) return error;
+                parts.Add(which + " placed from the ATM strategy.");
+                return null;
+            }
+
+            BandPick band = row.BandBox.SelectedItem as BandPick;
+            if (band == null || pick.Source == null) return "Choose a band for " + pick.Text + ".";
+            bool live;
+            lock (sync) live = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+            if (!live)
+            {
+                string error = PlaceIndicatorLeg(t, row.IsStop, pick.Source, band.Plot);
+                if (error != null) return error;
+            }
+            lock (sync) { AssignIndicatorLeg(t, row.IsStop, pick.Source.Indicator, band.Plot); }
+            if (live)
+            {
+                string note = FollowLeg(t, row.IsStop, CurrentBar);
+                if (!string.IsNullOrEmpty(note)) parts.Add(note);
+                else
+                {
+                    string bandName = row.BandBox.Visibility == Visibility.Visible ? (" " + band.Text) : "";
+                    parts.Add(which + " follows " + pick.Text + bandName + ".");
+                }
+            }
+            else
+            {
+                string bandName = row.BandBox.Visibility == Visibility.Visible ? (" " + band.Text) : "";
+                parts.Add(which + " placed on " + pick.Text + bandName + ".");
+            }
+            return null;
+        }
+
+        private void AssignAtmLeg(TrackedOrder t, bool isStop, string key, NinjaTrader.NinjaScript.AtmStrategy atm)
+        {
+                if (isStop)
+                {
+                    t.StopSource = LegFollow.Atm;
+                    t.StopIndicator = null;
+                    t.StopPaused = false;
+                    t.StopMissing = false;
+                    t.StopMacdSet = false;
+                }
+                else
+                {
+                    t.TargetSource = LegFollow.Atm;
+                    t.TargetIndicator = null;
+                    t.TargetEmaA = null;
+                    t.TargetEmaB = null;
+                    t.TargetEmaSign = 0;
+                    t.TargetCrossSent = false;
+                    t.TargetCrossPending = false;
+                    t.TargetPaused = false;
+                    t.TargetMissing = false;
+                    t.TargetMacdSet = false;
+                }
+            t.AtmName = key;
+            t.AtmTemplate = atm;
+        }
+
+        private void AssignIndicatorLeg(TrackedOrder t, bool isStop, NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, int plot)
+        {
+            if (isStop)
+            {
+                t.StopSource = LegFollow.Indicator;
+                t.StopIndicator = ind;
+                t.StopPlot = plot;
+                t.StopPaused = false;
+                t.StopMissing = false;
+                t.StopMacdSet = false;
+            }
+            else
+            {
+                t.TargetSource = LegFollow.Indicator;
+                t.TargetIndicator = ind;
+                t.TargetPlot = plot;
+                t.TargetEmaA = null;
+                t.TargetEmaB = null;
+                t.TargetEmaSign = 0;
+                t.TargetCrossSent = false;
+                t.TargetCrossPending = false;
+                t.TargetPaused = false;
+                t.TargetMissing = false;
+                t.TargetMacdSet = false;
+            }
+        }
+
+        private static bool IsMacdFollow(FollowPick pick)
+        {
+            return pick != null && pick.Kind == FollowKind.Indicator && IsMacd(pick.Source);
+        }
+
+        private static void AssignMacdLeg(TrackedOrder t, bool isStop, NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind,
+                                          double level, int sign)
+        {
+            int plot = FindMacdPlot(ind);
+            if (isStop)
+            {
+                t.StopSource = LegFollow.Macd;
+                t.StopIndicator = ind;
+                t.StopPlot = plot;
+                t.StopMacdSet = true;
+                t.StopMacdLevel = level;
+                t.StopMacdSign = sign;
+                t.StopPaused = false;
+                t.StopMissing = false;
+            }
+            else
+            {
+                t.TargetSource = LegFollow.Macd;
+                t.TargetIndicator = ind;
+                t.TargetPlot = plot;
+                t.TargetMacdSet = true;
+                t.TargetMacdLevel = level;
+                t.TargetMacdSign = sign;
+                t.TargetEmaA = null;
+                t.TargetEmaB = null;
+                t.TargetEmaSign = 0;
+                t.TargetCrossSent = false;
+                t.TargetCrossPending = false;
+                t.TargetPaused = false;
+                t.TargetMissing = false;
+            }
+            t.MacdCloseSent = false;
+            t.MacdClosePending = false;
+        }
+
+        private void SetRejectSource(TrackedOrder t, bool isStop)
+        {
+            lock (sync)
+            {
+                if (isStop) t.StopSource = LegFollow.None;
+                else t.TargetSource = LegFollow.None;
+            }
+        }
+
+        private void RestoreLegSource(TrackedOrder t, bool isStop, LegFollow source)
+        {
+            lock (sync)
+            {
+                if (isStop) t.StopSource = source;
+                else t.TargetSource = source;
+            }
+        }
+
+        private void SetLegNone(TrackedOrder t, bool isStop)
+        {
+            lock (sync)
+            {
+                if (isStop)
+                {
+                    t.StopSource = LegFollow.None;
+                    t.StopIndicator = null;
+                    t.StopPaused = false;
+                    t.StopMissing = false;
+                    t.StopMacdSet = false;
+                    t.Relink.RemoveAll(h => h.IsStop);
+                }
+                else
+                {
+                    t.TargetSource = LegFollow.None;
+                    t.TargetIndicator = null;
+                    t.TargetEmaA = null;
+                    t.TargetEmaB = null;
+                    t.TargetEmaSign = 0;
+                    t.TargetCrossSent = false;
+                    t.TargetCrossPending = false;
+                    t.TargetPaused = false;
+                    t.TargetMissing = false;
+                    t.TargetMacdSet = false;
+                    t.Relink.RemoveAll(h => !h.IsStop);
+                }
+            }
+        }
+
+        private string PreviewAtmLeg(TrackedOrder t, bool isStop, NinjaTrader.NinjaScript.AtmStrategy atm)
+        {
+            double fill, price;
+            int qty;
+            string error;
+            if (!TryAtmProtectivePrice(t, isStop, atm, out fill, out qty, out price, out error))
+                return error;
+            if (fill <= 0 || qty <= 0 || price <= 0) return "ATM price was not usable.";
+            return null;
+        }
+
+        private string PlaceAtmLeg(TrackedOrder t, bool isStop)
+        {
+            NinjaTrader.NinjaScript.AtmStrategy atm = SelectedAtm();
+            string key = atm == null ? null : AtmTemplateKey(atm);
+            if (atm == null || string.IsNullOrEmpty(key))
+                return "Select an ATM strategy in Chart Trader to use a fixed stop or target.";
+            double fill, price;
+            int qty;
+            string error;
+            if (!TryAtmProtectivePrice(t, isStop, atm, out fill, out qty, out price, out error))
+                return error;
+            error = PlaceProtective(t, isStop, price, qty);
+            if (error != null) return error;
+            lock (sync) { AssignAtmLeg(t, isStop, key, atm); }
+            return null;
+        }
+
+        private bool TryAtmProtectivePrice(TrackedOrder t, bool isStop, NinjaTrader.NinjaScript.AtmStrategy atm,
+                                            out double fill, out int qty, out double price, out string error)
+        {
+            fill = 0;
+            qty = 0;
+            price = 0;
+            error = null;
+            lock (sync)
+            {
+                fill = t.FillPrice > 0 ? t.FillPrice : (t.Order != null ? t.Order.AverageFillPrice : 0);
+                qty = OpenQuantity(t);
+            }
+            if (fill <= 0) { error = "That order has no fill price yet."; return false; }
+            if (qty <= 0) { error = "That order has no quantity left open."; return false; }
+            double stopVal, targetVal;
+            CalculationMode mode;
+            if (!TryReadBracket(atm, 0, out stopVal, out targetVal, out mode, out error))
+            {
+                if (string.IsNullOrEmpty(error)) error = "Could not read the ATM template.";
+                return false;
+            }
+            double value = isStop ? stopVal : targetVal;
+            if (!isStop && value.ApproxCompare(0) == 0)
+            {
+                error = "The ATM target is a runner, so no target was placed.";
+                return false;
+            }
+            if (!TryProtectivePrice(IsBuyAction(t.Action), isStop, fill, value, mode, out price, out error))
+            {
+                if (string.IsNullOrEmpty(error)) error = "ATM price was not usable.";
+                return false;
+            }
+            return SideError(t, isStop, price, out error);
+        }
+
+        private string PreviewProtective(TrackedOrder t, bool isStop, KcSource src, int plot)
+        {
+            double price;
+            int qty;
+            string error;
+            if (!TryPlotPrice(t, isStop, src, plot, out price, out qty, out error))
+                return error;
+            if (qty <= 0 || price <= 0) return "That indicator has no usable price.";
+            return null;
+        }
+
+        private string PlaceIndicatorLeg(TrackedOrder t, bool isStop, KcSource src, int plot)
+        {
+            double price;
+            int qty;
+            string error;
+            if (!TryPlotPrice(t, isStop, src, plot, out price, out qty, out error))
+                return error;
+            return PlaceProtective(t, isStop, price, qty);
+        }
+
+        private bool TryPlotPrice(TrackedOrder t, bool isStop, KcSource src, int plot, out double price, out int qty, out string error)
+        {
+            price = 0;
+            qty = 0;
+            error = null;
+            double raw;
+            string which = isStop ? "Stop" : "Target";
+            if (src == null || src.Indicator == null || !TryReadSeries(src.Indicator, plot, CurrentBar, out raw))
+            {
+                error = which + " was not placed: its indicator has no value.";
+                return false;
+            }
+            price = Instrument.MasterInstrument.RoundToTickSize(raw);
+            lock (sync) qty = OpenQuantity(t);
+            if (qty <= 0) { error = "That order has no quantity left open."; return false; }
+            return SideError(t, isStop, price, out error);
+        }
+
+        private bool SideError(TrackedOrder t, bool isStop, double price, out string error)
+        {
+            error = null;
+            if (ProtectiveOnRestingSide(IsBuyAction(t.Action), isStop, price)) return true;
+            error = (isStop ? "Stop" : "Target") + " was not placed: "
+                + Instrument.MasterInstrument.FormatPrice(price) + " is on the wrong side of the market.";
+            return false;
+        }
+
+        private void ArmRelink(TrackedOrder t, bool stops)
+        {
+            lock (sync)
+            {
+                t.Relink.RemoveAll(h => h.IsStop == stops && !h.Replaced);
+                List<Order> orders = stops ? t.StopOrders : t.TargetOrders;
+                foreach (Order o in orders)
+                {
+                    if (!IsChangeable(o)) continue;
+                    int qty = o.Quantity - o.Filled;
+                    if (qty <= 0) continue;
+                    double price = o.OrderType == OrderType.Limit ? o.LimitPrice : o.StopPrice;
+                    if (price <= 0) continue;
+                    t.Relink.Add(new HeldLeg { IsStop = stops, Original = o, Price = price, Qty = qty });
+                }
+            }
+        }
+
+        private bool CancelWorkingLegs(TrackedOrder t, bool stops)
+        {
+            string error;
+            CancelResolvedLegs(t, stops, out error);
+            return error == null;
+        }
+
+        // Working orders already stored on the leg, plus ATM orders on this entry that were never linked.
+        // The filled entry is never included. Orders owned by another tracked trade are left alone.
+        private int CancelResolvedLegs(TrackedOrder t, bool stops, out string error)
+        {
+            error = null;
+            if (t == null) return 0;
+            AttachWorkingLegs(t, stops);
+            List<Order> orders = new List<Order>();
+            lock (sync)
+            {
+                foreach (Order o in (stops ? t.StopOrders : t.TargetOrders))
+                {
+                    if (o == null || o == t.Order || !IsChangeable(o) || ContainsOrder(orders, o)) continue;
+                    orders.Add(o);
+                }
+            }
+            if (orders.Count == 0) return 0;
+            if (t.Account == null)
+            {
+                error = CouldNotCancel(stops);
+                return 0;
+            }
+            try
+            {
+                t.Account.Cancel(orders.ToArray());
+                return orders.Count;
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader leg cancel error: " + ex.Message);
+                error = CouldNotCancel(stops);
+                return 0;
+            }
+        }
+
+        private static string CouldNotCancel(bool stops)
+        {
+            return "Could not cancel the " + (stops ? "stop" : "target") + ".";
+        }
+
+        private void AttachWorkingLegs(TrackedOrder t, bool stops)
+        {
+            if (t == null || t.Account == null) return;
+            NinjaTrader.NinjaScript.StrategyBase owner;
+            lock (sync)
+            {
+                RefreshAtmOwner(t);
+                owner = t.AtmOwner;
+            }
+            if (owner == null) return;
+
+            Order[] live;
+            try { lock (t.Account.Orders) live = t.Account.Orders.ToArray(); }
+            catch { return; }
+
+            foreach (Order o in live)
+            {
+                if (!BelongsToEntryLeg(t, o, stops, owner)) continue;
+                lock (sync)
+                {
+                    if (OwnedByOther(t, o)) continue;
+                    List<Order> stored = stops ? t.StopOrders : t.TargetOrders;
+                    if (!ContainsOrder(stored, o)) stored.Add(o);
+                }
+            }
+        }
+
+        private bool BelongsToEntryLeg(TrackedOrder t, Order o, bool stops, NinjaTrader.NinjaScript.StrategyBase owner)
+        {
+            if (o == null || t == null || owner == null || o == t.Order || !IsChangeable(o)) return false;
+            if (o.Instrument == null || Instrument == null || o.Instrument.FullName != Instrument.FullName) return false;
+            string name = o.Name ?? "";
+            if (stops)
+            {
+                if (!name.StartsWith("Stop", StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            else if (!name.StartsWith("Target", StringComparison.OrdinalIgnoreCase)) return false;
+
+            NinjaTrader.NinjaScript.StrategyBase child = null;
+            try { child = o.GetOwnerStrategy(); }
+            catch { child = null; }
+            return child != null && ReferenceEquals(child, owner);
+        }
+
+        private bool OwnedByOther(TrackedOrder t, Order o)
+        {
+            foreach (TrackedOrder other in tracked)
+            {
+                if (other == t) continue;
+                if (other.Order == o || ContainsOrder(other.StopOrders, o) || ContainsOrder(other.TargetOrders, o))
+                    return true;
+            }
+            return false;
+        }
+
+        private string PlaceProtective(TrackedOrder t, bool isStop, double price, int qty)
+        {
+            if (t == null || t.Account == null || qty <= 0 || price <= 0)
+                return "Could not place the protective order.";
+            bool isLong = IsBuyAction(t.Action);
+            OrderAction action = isLong ? OrderAction.Sell : OrderAction.BuyToCover;
+            OrderType type = isStop ? OrderType.StopMarket : OrderType.Limit;
+            double lmt = type == OrderType.Limit ? price : 0;
+            double stp = type == OrderType.StopMarket ? price : 0;
+            try
+            {
+                Order o = t.Account.CreateOrder(Instrument, action, type, OrderEntry.Manual, OrderTif, qty,
+                    lmt, stp, string.Empty, isStop ? "Stop1" : "Target1", NinjaTrader.Core.Globals.MaxDate, null);
+                t.Account.Submit(new[] { o });
+                lock (sync)
+                {
+                    if (isStop) t.StopOrders.Add(o);
+                    else t.TargetOrders.Add(o);
+                }
+                HookAccount(t.Account);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader protective order error: " + ex.Message);
+                return "Could not place the " + (isStop ? "stop" : "target") + ".";
+            }
+        }
+
+        private void OnProtectiveState(Order o)
+        {
+            if (o == null) return;
+            TrackedOrder owner = null;
+            HeldLeg held = null;
+            bool finishCross = false;
+            bool finishMacd = false;
+            lock (sync)
+            {
+                foreach (TrackedOrder t in tracked)
+                {
+                    if (t.StopOrders.Contains(o)) { owner = t; break; }
+                    if (t.TargetOrders.Contains(o)) { owner = t; break; }
+                }
+                if (owner == null) return;
+                bool isStop = owner.StopOrders.Contains(o);
+                if (owner.TargetCrossPending && isStop)
+                {
+                    if (!HasLiveChild(owner.StopOrders)) finishCross = true;
+                }
+                else if (owner.MacdClosePending && isStop == owner.MacdCloseCancelsStop)
+                {
+                    List<Order> side = isStop ? owner.StopOrders : owner.TargetOrders;
+                    if (!HasLiveChild(side)) finishMacd = true;
+                }
+                else
+                {
+                    foreach (HeldLeg h in owner.Relink)
+                    {
+                        if (h.Replaced || h.Original != o) continue;
+                        h.Replaced = true;
+                        held = h;
+                        break;
+                    }
+                }
+            }
+            if (finishCross) FinishEmaClose(owner);
+            else if (finishMacd) FinishMacdClose(owner);
+            else if (held != null) RestoreHeld(owner, held, o);
+        }
+
+        private void RestoreHeld(TrackedOrder t, HeldLeg held, Order original)
+        {
+            int qty = original == null ? held.Qty : original.Quantity - original.Filled;
+            if (qty <= 0) qty = held.Qty;
+            if (qty <= 0 || held.Price <= 0) return;
+            string error = PlaceProtective(t, held.IsStop, held.Price, qty);
+            if (error != null) SetStatus(error);
+            else SetStatus((held.IsStop ? "Stop" : "Target") + " kept after the other leg was removed.");
+        }
+
+        private void TrackMacdNow()
+        {
+            if (State != State.Realtime || !IsFirstTickOfBar) return;
+            int bar = CurrentBar - 1;
+            if (bar < 0) return;
+            ReleaseMacdArms(bar);
+
+            List<TrackedOrder> orders;
+            lock (sync) orders = tracked.ToList();
+            foreach (TrackedOrder t in orders)
+            {
+                if (t.Completed || t.Order == null || t.Order.Filled <= 0 || t.MacdCloseSent) continue;
+                if (t.StopSource == LegFollow.Macd)
+                    ReportFollow(WatchMacdLeg(t, true, bar));
+                if (t.MacdCloseSent) continue;
+                if (t.TargetSource == LegFollow.Macd)
+                    ReportFollow(WatchMacdLeg(t, false, bar));
+            }
+        }
+
+        private void ArmMacdFromUi(OrderAction action)
+        {
+            KcSource src = selectedKc;
+            if (src == null || !IsMacd(src) || src.Indicator == null)
+            {
+                SetStatusNow("Select a MACD indicator in Track.");
+                return;
+            }
+            RememberKeltner();
+            KcSource price = keltnerPrice;
+            if (price == null || price.Indicator == null)
+            {
+                SetStatusNow("MACD needs a Keltner Channel on this chart. The order price is that midline.");
+                return;
+            }
+
+            // The level was chosen when MACD was selected in Track. Buy and Sell reuse it.
+            double level;
+            if (macdConfigured && !double.IsNaN(macdLevel))
+                level = macdLevel;
+            else
+            {
+                if (!PromptTrackMacd(src, out level))
+                    return;
+                macdLevel = level;
+                macdConfigured = true;
+                shownMacdText = null;
+            }
+
+            Account acct = SelectedAccount();
+            if (acct == null) { SetStatusNow("Select an account in Chart Trader."); return; }
+
+            RememberAtm();
+            int bar = ClosedBar();
+            int sign = 0;
+            if (bar < 0 || !TryMacdSign(src.Indicator, level, bar, out sign))
+            {
+                SetStatusNow("MACD has no value yet.");
+                return;
+            }
+
+            bool isBuy = action == OrderAction.Buy;
+            int qty = ReadQty();
+            string label = NewOrderLabel();
+            string levelText = FormatMacd(level);
+            string lineName = string.IsNullOrWhiteSpace(selectedLineName) ? "Midline" : selectedLineName;
+            int plot = ActivePlot(price);
+            lock (sync)
+            {
+                TrackedOrder t = new TrackedOrder();
+                t.Account = acct;
+                t.Action = action;
+                t.Quantity = qty;
+                t.Label = label;
+                t.Track = trackAll;
+                t.FollowThrough = true;
+                t.WaitMacd = true;
+                t.EntryMacd = src.Indicator;
+                t.EntryMacdLevel = level;
+                t.EntryMacdSign = sign;
+                t.EntryMacdBar = bar;
+                t.EntryPriceInd = price.Indicator;
+                t.EntryPricePlot = plot;
+                t.StopSource = LegFollow.Atm;
+                tracked.Add(t);
+            }
+
+            string wait = isBuy ? "MACD to cross above " + levelText : "MACD to cross below " + levelText;
+            SetStatusNow((isBuy ? "Buy" : "Sell") + " armed at the Keltner " + lineName + ". Waiting for " + wait + ".");
+        }
+
+        private void ReleaseMacdArms(int bar)
+        {
+            List<TrackedOrder> arms;
+            lock (sync) arms = tracked.Where(x => x.WaitMacd && x.Order == null).ToList();
+            foreach (TrackedOrder t in arms)
+            {
+                if (bar <= t.EntryMacdBar) continue;
+                int sign = 0;
+                if (t.EntryMacd == null || !TryMacdSign(t.EntryMacd, t.EntryMacdLevel, bar, out sign))
+                {
+                    if (!t.EntryMacdNoted)
+                    {
+                        t.EntryMacdNoted = true;
+                        SetStatus("MACD paused: the indicator has no value.");
+                    }
+                    continue;
+                }
+                t.EntryMacdNoted = false;
+                if (sign == 0 || sign == t.EntryMacdSign) continue;
+                int wanted = IsBuyAction(t.Action) ? 1 : -1;
+                if (sign != wanted)
+                {
+                    lock (sync) { t.EntryMacdSign = sign; t.EntryMacdBar = bar; }
+                    continue;
+                }
+                string msg = SubmitArmedMacd(t, bar, sign);
+                if (!string.IsNullOrEmpty(msg)) SetStatus(msg);
+            }
+        }
+
+        private string SubmitArmedMacd(TrackedOrder t, int bar, int sign)
+        {
+            if (t == null || t.Account == null || t.Quantity <= 0) return "Could not place the MACD entry.";
+            bool isBuy = IsBuyAction(t.Action);
+
+            int priceBar = CurrentBar;
+            if (TrackMode == NinjaTrader.NinjaScript.KcMidTraderTypes.KcTrackMode.OnBarClose)
+                priceBar = CurrentBar - 1;
+            if (priceBar < 0) priceBar = bar;
+
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase priceInd = t.EntryPriceInd;
+            int pricePlot = t.EntryPricePlot;
+            KcSource livePrice = keltnerPrice;
+            if (livePrice != null && livePrice.Indicator != null
+                && (priceInd == null || ReferenceEquals(livePrice.Indicator, priceInd)))
+            {
+                priceInd = livePrice.Indicator;
+                pricePlot = ActivePlot(livePrice);
+            }
+
+            double raw;
+            if (priceInd == null || !TryReadSeries(priceInd, pricePlot, priceBar, out raw))
+            {
+                if (!t.EntryMacdNoted)
+                {
+                    t.EntryMacdNoted = true;
+                    return (t.Label ?? "Order") + "  waiting: the Keltner line has no price yet.";
+                }
+                return null;
+            }
+            t.EntryMacdNoted = false;
+
+            double mid = Instrument.MasterInstrument.RoundToTickSize(raw);
+            double price = OffsetPrice(isBuy, mid);
+            double refPx = RefPrice(isBuy);
+            if (double.IsNaN(refPx))
+                return null;
+
+            // Same price rules as a Keltner order. The stop side is sent too: the MACD cross is the trigger,
+            // and FollowThrough keeps that order on the line afterwards.
+            OrderType? type = DesiredType(isBuy, price, refPx);
+            if (type == null)
+                return null;
+
+            double lmt = type.Value == OrderType.Limit ? price : 0;
+            double stp = type.Value == OrderType.StopMarket ? price : 0;
+
+            string chosenAtm = "";
+            NinjaTrader.NinjaScript.AtmStrategy atm = null;
+            if (UseChartTraderAtm)
+            {
+                chosenAtm = liveAtmKey ?? "";
+                atm = chosenAtm.Length > 0 ? liveAtm : null;
+            }
+
+            OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
+            string orderName = chosenAtm.Length > 0 ? "Entry" : OrderNamePrefix + (isBuy ? "Buy" : "Sell");
+            Order o;
+            try
+            {
+                o = t.Account.CreateOrder(Instrument, action, type.Value, OrderEntry.Manual, OrderTif, t.Quantity,
+                    lmt, stp, string.Empty, orderName, NinjaTrader.Core.Globals.MaxDate, null);
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader MACD entry error: " + ex.Message);
+                return (t.Label ?? "Order") + "  Error: " + ex.Message;
+            }
+
+            HookAccount(t.Account);
+            lock (sync)
+            {
+                t.Order = o;
+                t.FollowThrough = true;
+                t.AtmTemplate = atm;
+                t.AtmName = chosenAtm;
+                t.FollowAtm = chosenAtm.Length > 0;
+                t.StopSource = LegFollow.Atm;
+                t.TargetSource = LegFollow.Atm;
+            }
+
+            try
+            {
+                if (chosenAtm.Length > 0)
+                {
+                    System.Threading.Interlocked.Increment(ref suppressAtmEvents);
+                    try { NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(chosenAtm, o); }
+                    finally { System.Threading.Interlocked.Decrement(ref suppressAtmEvents); }
+                }
+                else
+                    t.Account.Submit(new[] { o });
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader MACD entry error: " + ex.Message);
+                lock (sync)
+                {
+                    bool filled = o != null && o.Filled > 0;
+                    if (!filled)
+                    {
+                        t.Order = null;
+                        t.WaitMacd = true;
+                    }
+                    else
+                    {
+                        t.WaitMacd = false;
+                        t.EntryMacdSign = sign;
+                        t.EntryMacdBar = bar;
+                    }
+                }
+                return (t.Label ?? "Order") + "  Error: " + ex.Message;
+            }
+
+            lock (sync)
+            {
+                t.WaitMacd = false;
+                t.EntryMacdSign = sign;
+                t.EntryMacdBar = bar;
+            }
+            RefreshAtmOwner(t);
+
+            string kind = type.Value == OrderType.Limit ? "LMT" : "STP";
+            string msg = string.Format("{0}  {1} {2} {3} @ {4} when MACD crossed {5}",
+                t.Label, isBuy ? "BUY" : "SELL", t.Quantity, kind,
+                Instrument.MasterInstrument.FormatPrice(price), FormatMacd(t.EntryMacdLevel));
+            if (t.Track) msg += " (tracking the Keltner line)";
+            msg += chosenAtm.Length == 0
+                ? ". No ATM strategy was selected."
+                : ". Stop and target stay on the ATM.";
+            return msg;
+        }
+
+        private string WatchMacdLeg(TrackedOrder t, bool isStop, int barIndex)
+        {
+            if (t == null) return null;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind;
+            double level;
+            int prev;
+            lock (sync)
+            {
+                if (t.MacdCloseSent || t.MacdClosePending || t.TargetCrossPending) return null;
+                if ((isStop ? t.StopSource : t.TargetSource) != LegFollow.Macd) return null;
+                ind = isStop ? t.StopIndicator : t.TargetIndicator;
+                level = isStop ? t.StopMacdLevel : t.TargetMacdLevel;
+                prev = isStop ? t.StopMacdSign : t.TargetMacdSign;
+            }
+            string which = isStop ? "Stop" : "Target";
+            int sign;
+            if (ind == null || !TryMacdSign(ind, level, barIndex, out sign))
+            {
+                if (NoteLegFlag(t, isStop, false))
+                    return which + " paused: MACD has no value.";
+                return null;
+            }
+
+            bool isLong = IsBuyAction(t.Action);
+            int hit = MacdHitSign(isLong, isStop);
+            bool crossed = false;
+            lock (sync)
+            {
+                if (t.MacdCloseSent || (isStop ? t.StopSource : t.TargetSource) != LegFollow.Macd) return null;
+                prev = isStop ? t.StopMacdSign : t.TargetMacdSign;
+                if (prev == int.MinValue)
+                {
+                    bool already = hit < 0 ? sign <= 0 : sign >= 0;
+                    int stored = already ? hit : sign;
+                    if (isStop) t.StopMacdSign = stored;
+                    else t.TargetMacdSign = stored;
+                    return null;
+                }
+                crossed = hit < 0 ? (prev > 0 && sign <= 0) : (prev < 0 && sign >= 0);
+                if (!crossed && sign != 0)
+                {
+                    if (isStop) t.StopMacdSign = sign;
+                    else t.TargetMacdSign = sign;
+                }
+            }
+            if (!crossed) return null;
+            BeginMacdClose(t, isStop);
+            return which + " closing on MACD.";
+        }
+
+        private void BeginMacdClose(TrackedOrder t, bool isStop)
+        {
+            bool changeable, live;
+            bool cancelStops = !isStop;
+            lock (sync)
+            {
+                if (t.MacdCloseSent || t.TargetCrossSent) return;
+                t.MacdCloseSent = true;
+                t.MacdClosePending = true;
+                t.MacdCloseCancelsStop = cancelStops;
+                t.Relink.RemoveAll(h => h.IsStop == cancelStops);
+                changeable = HasWorkingChild(cancelStops ? t.StopOrders : t.TargetOrders);
+                live = HasLiveChild(cancelStops ? t.StopOrders : t.TargetOrders);
+            }
+            if (changeable)
+            {
+                if (!CancelWorkingLegs(t, cancelStops))
+                {
+                    lock (sync)
+                    {
+                        t.MacdCloseSent = false;
+                        t.MacdClosePending = false;
+                    }
+                }
+            }
+            else if (!live) FinishMacdClose(t);
+        }
+
+        private void FinishMacdClose(TrackedOrder t)
+        {
+            bool go = false;
+            int qty = 0;
+            lock (sync)
+            {
+                go = t.MacdClosePending && !HasLiveChild(t.MacdCloseCancelsStop ? t.StopOrders : t.TargetOrders);
+                if (!go) return;
+                t.MacdClosePending = false;
+                qty = OpenQuantity(t);
+            }
+            if (qty <= 0 || t.Account == null) return;
+            bool isLong = IsBuyAction(t.Action);
+            OrderAction action = isLong ? OrderAction.Sell : OrderAction.BuyToCover;
+            try
+            {
+                Order o = t.Account.CreateOrder(Instrument, action, OrderType.Market, OrderEntry.Manual, OrderTif, qty,
+                    0, 0, string.Empty, "Close", NinjaTrader.Core.Globals.MaxDate, null);
+                t.Account.Submit(new[] { o });
+                lock (sync) t.CloseOrders.Add(o);
+                HookAccount(t.Account);
+                SetStatus("Closed on MACD.");
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader MACD close error: " + ex.Message);
+                lock (sync)
+                {
+                    t.MacdCloseSent = false;
+                    t.MacdClosePending = false;
+                }
+                SetStatus("MACD could not close the position.");
+            }
+        }
+
+        private void ArmEmaCrossFromUi(OrderAction action)
+        {
+            if (!crossConfigured || crossEmaA == null || crossEmaB == null || ReferenceEquals(crossEmaA, crossEmaB))
+            {
+                SetStatusNow("Configure EMA cross before using it.");
+                return;
+            }
+            if (emaOnChart < 2)
+            {
+                SetStatusNow("EMA cross needs two EMAs.");
+                return;
+            }
+            Account acct = SelectedAccount();
+            if (acct == null) { SetStatusNow("Select an account in Chart Trader."); return; }
+
+            RememberAtm();
+            int bar = CurrentBar - 1;
+            int sign;
+            if (bar < 0 || !TryEmaSign(crossEmaA, crossEmaB, bar, out sign))
+            {
+                SetStatusNow("EMA cross has no value yet.");
+                return;
+            }
+
+            bool isBuy = action == OrderAction.Buy;
+            int qty = ReadQty();
+            string label = NewOrderLabel();
+            lock (sync)
+            {
+                TrackedOrder t = new TrackedOrder();
+                t.Account = acct;
+                t.Action = action;
+                t.Quantity = qty;
+                t.Label = label;
+                t.Track = false;
+                t.WaitCross = true;
+                t.ArmSign = sign;
+                t.ArmBar = bar;
+                t.EntryCrossBar = -1;
+                t.TargetEmaA = crossEmaA;
+                t.TargetEmaB = crossEmaB;
+                t.StopSource = LegFollow.Atm;
+                tracked.Add(t);
+            }
+
+            string wait = isBuy
+                ? crossEmaAName + " to cross above " + crossEmaBName
+                : crossEmaAName + " to cross below " + crossEmaBName;
+            SetStatusNow((isBuy ? "Buy" : "Sell") + " armed. Waiting for " + wait + ".");
+        }
+
+        private bool TryEmaSign(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase a,
+                                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase b, int bar, out int sign)
+        {
+            sign = 0;
+            double va, vb;
+            if (a == null || b == null || bar < 0) return false;
+            if (!TryReadSeries(a, 0, bar, out va) || !TryReadSeries(b, 0, bar, out vb)) return false;
+            sign = va.ApproxCompare(vb);
+            return true;
+        }
+
+        // Closed bar only. The side stored on the arm is not an entry, and the entry bar is not an exit.
+        private void TrackEmaCrossNow()
+        {
+            if (State != State.Realtime || !IsFirstTickOfBar) return;
+            int bar = CurrentBar - 1;
+            if (bar < 0) return;
+            ReleaseEmaCrossArms(bar);
+
+            List<TrackedOrder> orders;
+            lock (sync) orders = tracked.ToList();
+            foreach (TrackedOrder t in orders)
+            {
+                if (t.Completed || t.Order == null || t.Order.Filled <= 0) continue;
+                if (t.TargetSource != LegFollow.EmaCross) continue;
+                ReportFollow(WatchEmaCross(t, bar));
+            }
+        }
+
+        private void ReleaseEmaCrossArms(int bar)
+        {
+            if (emaOnChart < 2)
+            {
+                bool waiting;
+                lock (sync) waiting = tracked.Any(x => x.WaitCross && x.Order == null);
+                if (waiting && !crossPausedNoted)
+                {
+                    crossPausedNoted = true;
+                    SetStatus("EMA cross paused: an EMA was removed.");
+                }
+                return;
+            }
+            crossPausedNoted = false;
+
+            List<TrackedOrder> arms;
+            lock (sync) arms = tracked.Where(x => x.WaitCross && x.Order == null).ToList();
+            foreach (TrackedOrder t in arms)
+            {
+                int sign;
+                if (!TryEmaSign(t.TargetEmaA, t.TargetEmaB, bar, out sign))
+                {
+                    if (!t.ArmNoted)
+                    {
+                        t.ArmNoted = true;
+                        SetStatus("EMA cross paused: an EMA has no value.");
+                    }
+                    continue;
+                }
+                t.ArmNoted = false;
+                if (sign == 0 || sign == t.ArmSign) continue;
+                int wanted = IsBuyAction(t.Action) ? 1 : -1;
+                if (sign != wanted)
+                {
+                    lock (sync) { t.ArmSign = sign; t.ArmBar = bar; }
+                    continue;
+                }
+                string msg = SubmitArmedCross(t, bar, sign);
+                if (!string.IsNullOrEmpty(msg)) SetStatus(msg);
+            }
+        }
+
+        private string SubmitArmedCross(TrackedOrder t, int bar, int sign)
+        {
+            if (t == null || t.Account == null || t.Quantity <= 0) return "Could not place the EMA cross entry.";
+            bool isBuy = IsBuyAction(t.Action);
+            string chosenAtm = "";
+            NinjaTrader.NinjaScript.AtmStrategy atm = null;
+            if (UseChartTraderAtm)
+            {
+                chosenAtm = liveAtmKey ?? "";
+                atm = chosenAtm.Length > 0 ? liveAtm : null;
+            }
+
+            OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
+            string orderName = chosenAtm.Length > 0 ? "Entry" : OrderNamePrefix + (isBuy ? "Buy" : "Sell");
+            Order o;
+            try
+            {
+                o = t.Account.CreateOrder(Instrument, action, OrderType.Market, OrderEntry.Manual, OrderTif, t.Quantity,
+                    0, 0, string.Empty, orderName, NinjaTrader.Core.Globals.MaxDate, null);
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader EMA cross entry error: " + ex.Message);
+                return (t.Label ?? "Order") + "  Error: " + ex.Message;
+            }
+
+            // Arm the exit before the ATM builds its brackets, so the target is cancelled and the stop stays.
+            HookAccount(t.Account);
+            lock (sync)
+            {
+                t.Order = o;
+                t.Track = false;
+                t.AtmTemplate = atm;
+                t.AtmName = chosenAtm;
+                t.FollowAtm = chosenAtm.Length > 0;
+                t.StopSource = LegFollow.Atm;
+                t.TargetSource = LegFollow.EmaCross;
+                t.TargetIndicator = null;
+                t.TargetEmaSign = sign;
+                t.EntryCrossBar = bar;
+                t.TargetCrossSent = false;
+                t.TargetCrossPending = false;
+                t.TargetPaused = false;
+                t.TargetMissing = false;
+            }
+
+            try
+            {
+                if (chosenAtm.Length > 0)
+                {
+                    System.Threading.Interlocked.Increment(ref suppressAtmEvents);
+                    try { NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(chosenAtm, o); }
+                    finally { System.Threading.Interlocked.Decrement(ref suppressAtmEvents); }
+                }
+                else
+                    t.Account.Submit(new[] { o });
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader EMA cross entry error: " + ex.Message);
+                lock (sync)
+                {
+                    bool filled = o != null && o.Filled > 0;
+                    if (!filled)
+                    {
+                        t.Order = null;
+                        t.WaitCross = true;
+                        t.TargetSource = LegFollow.Atm;
+                        t.TargetEmaSign = 0;
+                        t.EntryCrossBar = -1;
+                        t.ArmSign = sign;
+                        t.ArmBar = bar;
+                    }
+                    else
+                        t.WaitCross = false;
+                }
+                return (t.Label ?? "Order") + "  Error: " + ex.Message;
+            }
+
+            lock (sync)
+            {
+                t.WaitCross = false;
+                t.ArmSign = sign;
+                t.ArmBar = bar;
+            }
+            RefreshAtmOwner(t);
+
+            string msg = string.Format("{0}  {1} {2} MKT on EMA cross",
+                t.Label, isBuy ? "BUY" : "SELL", t.Quantity);
+            if (chosenAtm.Length == 0)
+                msg += ". Stop was not placed.";
+            else
+                msg += ". Stop stays on the ATM. Target waits for the next EMA cross.";
+            return msg;
+        }
+
+        private string WatchEmaCross(TrackedOrder t, int barIndex)
+        {
+            if (t == null) return null;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase a, b;
+            lock (sync)
+            {
+                if (t.TargetSource != LegFollow.EmaCross || t.TargetCrossSent || t.TargetCrossPending) return null;
+                if (t.EntryCrossBar >= 0 && barIndex <= t.EntryCrossBar) return null;
+                a = t.TargetEmaA;
+                b = t.TargetEmaB;
+            }
+            double va, vb;
+            if (a == null || b == null || !TryReadSeries(a, 0, barIndex, out va) || !TryReadSeries(b, 0, barIndex, out vb))
+            {
+                if (NoteLegFlag(t, false, false))
+                    return "EMA cross paused: an EMA has no value.";
+                return null;
+            }
+            int sign = va.ApproxCompare(vb);
+            if (sign == 0) return null;
+            lock (sync)
+            {
+                if (t.TargetSource != LegFollow.EmaCross || t.TargetCrossSent || t.TargetCrossPending) return null;
+                if (t.EntryCrossBar >= 0 && barIndex <= t.EntryCrossBar) return null;
+                int prev = t.TargetEmaSign;
+                if (prev == 0)
+                {
+                    t.TargetEmaSign = sign;
+                    t.TargetMissing = false;
+                    t.TargetPaused = false;
+                    return null;
+                }
+                if (sign == prev) return null;
+            }
+            BeginEmaClose(t);
+            return "Target closing on EMA cross.";
+        }
+
+        private void BeginEmaClose(TrackedOrder t)
+        {
+            bool changeable, live;
+            lock (sync)
+            {
+                if (t.TargetCrossSent || t.MacdCloseSent) return;
+                t.TargetCrossSent = true;
+                t.TargetCrossPending = true;
+                t.Relink.RemoveAll(h => h.IsStop);
+                changeable = HasWorkingChild(t.StopOrders);
+                live = HasLiveChild(t.StopOrders);
+            }
+            if (changeable)
+            {
+                if (!CancelWorkingLegs(t, true))
+                {
+                    lock (sync)
+                    {
+                        t.TargetCrossSent = false;
+                        t.TargetCrossPending = false;
+                    }
+                }
+            }
+            else if (!live) FinishEmaClose(t);
+        }
+
+        private void FinishEmaClose(TrackedOrder t)
+        {
+            bool go;
+            int qty;
+            lock (sync)
+            {
+                go = t.TargetCrossPending && !HasLiveChild(t.StopOrders);
+                if (!go) return;
+                t.TargetCrossPending = false;
+                qty = OpenQuantity(t);
+            }
+            if (qty <= 0 || t.Account == null) return;
+            bool isLong = IsBuyAction(t.Action);
+            OrderAction action = isLong ? OrderAction.Sell : OrderAction.BuyToCover;
+            try
+            {
+                Order o = t.Account.CreateOrder(Instrument, action, OrderType.Market, OrderEntry.Manual, OrderTif, qty,
+                    0, 0, string.Empty, "Close", NinjaTrader.Core.Globals.MaxDate, null);
+                t.Account.Submit(new[] { o });
+                lock (sync) t.CloseOrders.Add(o);
+                HookAccount(t.Account);
+                SetStatus("Closed on EMA cross.");
+            }
+            catch (Exception ex)
+            {
+                Print("KcMidTrader EMA cross close error: " + ex.Message);
+                lock (sync)
+                {
+                    t.TargetCrossSent = false;
+                    t.TargetCrossPending = false;
+                }
+                SetStatus("EMA cross could not close the position.");
+            }
+        }
+
+        private static bool HasLiveChild(List<Order> orders)
+        {
+            if (orders == null) return false;
+            for (int i = 0; i < orders.Count; i++)
+            {
+                Order o = orders[i];
+                if (o != null && !Order.IsTerminalState(o.OrderState)) return true;
+            }
+            return false;
+        }
+
+        private static int FilledQty(List<Order> orders)
+        {
+            int n = 0;
+            if (orders == null) return 0;
+            foreach (Order o in orders)
+                if (o != null && o.Filled > 0) n += o.Filled;
+            return n;
+        }
+
+        private static int OpenQuantity(TrackedOrder t)
+        {
+            if (t == null || t.Order == null) return 0;
+            int left = t.Order.Filled - FilledQty(t.StopOrders) - FilledQty(t.TargetOrders) - FilledQty(t.CloseOrders);
+            return left > 0 ? left : 0;
         }
 
         // =================================================================================
