@@ -9,9 +9,9 @@
 //    * show or hide that offset zone (light blue above, light red below)
 //    * BUY or SELL at the selected line plus that offset with one click (Midline by default)
 //    * keep those orders ATTACHED to the offset price (they follow the selected line as it moves)
-//    * on one checked filled order, point its stop or target at an indicator, remove either leg without closing the position, close the target on an EMA cross, or close either leg when MACD crosses a level
+//    * on one checked filled order, point its stop or target at an indicator, remove either leg without closing the position, close the target on an EMA cross, or close the position when MACD falls through an absolute level
 //    * with two or more EMAs, track an EMA cross: Buy or Sell stays not filled until a later favorable cross, then the ATM stop is kept and the target waits for the next cross
-//    * MACD is a trigger, not a price: the order follows the Keltner midline and is sent only when the MACD line crosses the level from the window, including a buy above the market or a sell below it. A stop or target can close on a MACD level too
+//    * MACD is a trigger, not a price. The Track window stores a magnitude. Buy waits for MACD to cross above it and Sell waits for MACD to cross below it. The order stays not filled until that cross, then a limit is sent at the Keltner midline and the selected ATM starts. On a filled order, SL / TP uses its own magnitude (default 0, a minus sign is ignored). At 0 a buy closes when MACD crosses down through 0 and a sell closes when MACD crosses up through 0. Any other magnitude closes either side when the absolute MACD level falls through it. A cross that is already true waits until MACD leaves the level and crosses again
 //    * CANCEL every order this tool placed with one click
 //
 //  The section is only shown while a (visible) stock Keltner Channel is on the chart.
@@ -140,19 +140,20 @@ namespace NinjaTrader.NinjaScript.Indicators
             public int          ArmSign;          // EMA A vs B on the closed bar when the arm was placed or last updated
             public int          ArmBar;
             public bool         WaitMacd;         // NF arm: no broker order until MACD crosses EntryMacdLevel
-            public double       EntryMacdLevel;
+            public double       EntryMacdLevel;   // signed: +magnitude for a buy, -magnitude for a sell
             public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase EntryMacd;
             public int          EntryMacdSign;    // MACD vs level when the arm was placed or last updated
             public int          EntryMacdBar = -1;
             public bool         EntryMacdNoted;
+            public bool         EntryMacdAwaitLimit; // threshold crossed; NF until the midline is a limit
             public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase EntryPriceInd; // Keltner the order price follows
             public int          EntryPricePlot;
             public bool         FollowThrough;    // keep following the Keltner price on the stop side of the market
             public bool         StopMacdSet;
-            public double       StopMacdLevel;
+            public double       StopMacdLevel;    // absolute magnitude; 0 is the zero line
             public int          StopMacdSign;     // int.MinValue until the closed bar is known
             public bool         TargetMacdSet;
-            public double       TargetMacdLevel;
+            public double       TargetMacdLevel;  // absolute magnitude; 0 is the zero line
             public int          TargetMacdSign;
             public bool         MacdCloseSent;
             public bool         MacdClosePending;
@@ -1199,8 +1200,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             lastMid = double.NaN;
             shownMacdText = null;
             RefreshLineCombo(true);
-            SetStatusNow("Tracking the Keltner " + selectedLineName + ". MACD level is " + FormatMacd(level)
-                + ". Buy or Sell uses this level and waits for the cross.");
+            SetStatusNow("Tracking the Keltner " + selectedLineName + ". MACD magnitude is " + FormatMacd(level)
+                + ". Buy waits for a cross above it. Sell waits for a cross below it.");
             UpdateReadout();
             if (ChartControl != null) ChartControl.InvalidateVisual();
         }
@@ -1638,7 +1639,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Background = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
                 Foreground = Brushes.White,
                 Visibility = Visibility.Collapsed,
-                ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close either leg when MACD crosses a level."
+                ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close the position when MACD crosses an absolute level."
             };
             legButton.Click += OnLegButtonClick;
             orderLists.Children.Add(legButton);
@@ -2251,7 +2252,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (t.Completed)
             {
                 string pts = FormatPoints(t.Points);
-                tail = t.Points < 0 ? ("L-" + pts) : ("F-W-" + pts);
+                tail = t.Points < 0 ? ("F-L-" + pts) : ("F-W-" + pts);
             }
             else
                 tail = IsListedFilled(t) ? "F" : "NF";
@@ -3349,7 +3350,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             legButton.Visibility = Visibility.Visible;
             legButton.IsEnabled = true;
-            legButton.ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close either leg when MACD crosses a level.";
+            legButton.ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close the position when MACD crosses an absolute level.";
         }
 
         private void OnLegButtonClick(object sender, RoutedEventArgs e)
@@ -3652,7 +3653,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (mode == LegFollow.Macd && savedMacd && savedInd != null)
             {
                 row.MacdSet = true;
-                row.MacdLevel = savedMacdLevel;
+                row.MacdLevel = Math.Abs(savedMacdLevel);
                 row.MacdIndicator = savedInd;
             }
             source.SelectionChanged += delegate
@@ -3746,7 +3747,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             return row;
         }
 
-        // Stored level when this leg already follows this MACD. Otherwise the suggestion for this side.
+        // Magnitude for this leg. The box starts at 0, or at the magnitude already chosen for this MACD.
+        // The hint is separate from the Track magnitude.
         private bool PromptLegMacd(Window owner, TrackedOrder t, LegDialogRow row, FollowPick pick,
                                    NinjaTrader.Gui.NinjaScript.IndicatorRenderBase savedInd, bool savedMacd, double savedLevel,
                                    LegFollow mode, out double level)
@@ -3761,23 +3763,29 @@ namespace NinjaTrader.NinjaScript.Indicators
             string reason = null;
             bool got = false;
             bool isLong = IsBuyAction(t.Action);
-            try { got = TrySuggestLegMacd(pick.Source.Indicator, isLong, row.IsStop, out suggested, out reason); }
+            try { got = TrySuggestExitMagnitude(pick.Source.Indicator, isLong, out suggested, out reason); }
             catch (Exception ex)
             {
                 Print("KcMidTrader MACD suggestion error: " + ex.Message);
                 got = false;
             }
             string suggestion = got
-                ? "Suggested: " + FormatMacd(suggested) + ". " + reason + "."
-                : "MACD has no closed value yet. Type a level.";
+                ? "Suggested magnitude: " + FormatMacd(suggested) + ". " + reason + "."
+                : "MACD has no closed value yet. Type a magnitude.";
             string prefill;
-            if (sameSession) prefill = FormatMacd(row.MacdLevel);
-            else if (sameSaved) prefill = FormatMacd(savedLevel);
-            else prefill = got ? FormatMacd(suggested) : "";
-            string intro = MacdHitSign(isLong, row.IsStop) < 0
-                ? "This leg closes when the MACD line crosses down through the level. A level that is already crossed does not close until the line leaves it and crosses again."
-                : "This leg closes when the MACD line crosses up through the level. A level that is already crossed does not close until the line leaves it and crosses again.";
-            return ShowMacdLevelDialog(owner, row.IsStop ? "MACD stop" : "MACD target", intro, prefill, suggestion, out level);
+            if (sameSession) prefill = FormatMacd(Math.Abs(row.MacdLevel));
+            else if (sameSaved) prefill = FormatMacd(Math.Abs(savedLevel));
+            else prefill = "0";
+            string intro = isLong
+                ? "Enter a magnitude. A minus sign is ignored. This level is separate from Track, and it starts at 0.\n"
+                  + "At 0, a filled buy closes when MACD crosses down through 0, from positive to negative.\n"
+                  + "Above 0, it closes when the absolute MACD level falls through that magnitude.\n"
+                  + "A cross that is already true waits until MACD leaves the level and crosses again."
+                : "Enter a magnitude. A minus sign is ignored. This level is separate from Track, and it starts at 0.\n"
+                  + "At 0, a filled sell closes when MACD crosses up through 0, from negative to positive.\n"
+                  + "Above 0, it closes when the absolute MACD level falls through that magnitude.\n"
+                  + "A cross that is already true waits until MACD leaves the level and crosses again.";
+            return ShowMacdLevelDialog(owner, row.IsStop ? "MACD stop" : "MACD target", intro, prefill, suggestion, out level, true);
         }
 
         private static System.Windows.Controls.TextBlock EmaLabel(string text)
@@ -3992,11 +4000,23 @@ namespace NinjaTrader.NinjaScript.Indicators
             return true;
         }
 
-        // Long stop and short target are hit from above. Long target and short stop are hit from below.
-        private static int MacdHitSign(bool isLong, bool isStop)
+        // A positive magnitude compares |MACD| with that magnitude. Zero compares MACD with the zero line.
+        private bool TryMacdExitSign(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, double magnitude, int bar, out int sign)
         {
-            bool below = (isLong && isStop) || (!isLong && !isStop);
-            return below ? -1 : 1;
+            sign = 0;
+            double value;
+            int plot = FindMacdPlot(ind);
+            if (!TryReadOscillator(ind, plot, bar, out value)) return false;
+            double compared = magnitude > 0 ? Math.Abs(value) : value;
+            sign = compared.ApproxCompare(magnitude > 0 ? magnitude : 0);
+            return true;
+        }
+
+        // Above 0, either side closes when |MACD| falls through the magnitude.
+        // At 0, a buy closes on a cross down through 0 and a sell on a cross up through 0.
+        private static bool MacdExitFalls(double magnitude, bool isLong)
+        {
+            return magnitude > 0 || isLong;
         }
 
         // Closed bars only, oldest first. At most 78 values.
@@ -4061,69 +4081,60 @@ namespace NinjaTrader.NinjaScript.Indicators
             return true;
         }
 
-        // Filled stop or target. The side of zero decides whether zero itself is the degradation.
-        private bool TrySuggestLegMacd(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, bool isLong, bool isStop,
-                                       out double level, out string reason)
+        // Filled exit. A magnitude on the far side of zero: a swing low for a buy, a swing high for a sell.
+        // Zero when that side has no swing yet. The box itself stays at 0 unless the user already chose one.
+        private bool TrySuggestExitMagnitude(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, bool isLong,
+                                             out double magnitude, out string reason)
         {
-            level = 0;
+            magnitude = 0;
             reason = null;
             List<double> vals;
             if (!ReadMacdHistory(ind, out vals)) return false;
             double current = vals[vals.Count - 1];
-            int vsZero = current.ApproxCompare(0);
-
-            bool wantHigh;
-            bool betweenZero;
-            bool fallbackZero;
-            if (vsZero == 0)
+            double swing;
+            if (TryNearestExitSwing(vals, current, isLong, out swing))
             {
-                bool lowSide = (isLong && isStop) || (!isLong && !isStop);
-                wantHigh = !lowSide;
-                betweenZero = false;
-                fallbackZero = false;
-            }
-            else if (isLong && vsZero > 0)
-            {
-                wantHigh = !isStop;
-                betweenZero = isStop;
-                fallbackZero = isStop;
-            }
-            else if (isLong)
-            {
-                wantHigh = !isStop;
-                betweenZero = !isStop;
-                fallbackZero = !isStop;
-            }
-            else if (vsZero < 0)
-            {
-                wantHigh = isStop;
-                betweenZero = isStop;
-                fallbackZero = isStop;
-            }
-            else
-            {
-                wantHigh = isStop;
-                betweenZero = !isStop;
-                fallbackZero = !isStop;
-            }
-
-            if (TryNearestSwing(vals, current, wantHigh, betweenZero, out level))
-            {
-                reason = wantHigh
-                    ? "Nearest MACD swing high above the line"
-                    : "Nearest MACD swing low below the line";
+                magnitude = Math.Abs(swing);
+                reason = isLong
+                    ? "Nearest MACD swing low below zero"
+                    : "Nearest MACD swing high above zero";
                 return true;
             }
-            if (fallbackZero)
+            magnitude = 0;
+            reason = "Zero line";
+            return true;
+        }
+
+        // The swing must sit beyond zero and beyond the current line, so it is still ahead of the exit.
+        private static bool TryNearestExitSwing(List<double> vals, double current, bool wantLow, out double level)
+        {
+            level = 0;
+            int last = vals.Count - 1;
+            double best = 0;
+            int bestBar = -1;
+            bool found = false;
+            for (int i = 2; i <= last - 2; i++)
             {
-                level = 0;
-                reason = "Zero line";
-                return true;
+                double v = vals[i];
+                bool high = v > vals[i - 1] && v > vals[i - 2] && v > vals[i + 1] && v > vals[i + 2];
+                bool low = v < vals[i - 1] && v < vals[i - 2] && v < vals[i + 1] && v < vals[i + 2];
+                if (wantLow && !low) continue;
+                if (!wantLow && !high) continue;
+                if (wantLow)
+                {
+                    if (v.ApproxCompare(0) >= 0 || v.ApproxCompare(current) >= 0) continue;
+                }
+                else if (v.ApproxCompare(0) <= 0 || v.ApproxCompare(current) <= 0) continue;
+                double dist = Math.Abs(v - current);
+                if (!found || dist < Math.Abs(best - current) || (dist == Math.Abs(best - current) && i > bestBar))
+                {
+                    found = true;
+                    best = v;
+                    bestBar = i;
+                }
             }
-            double range = MacdRange(vals);
-            if (range <= 0) return false;
-            level = wantHigh ? current + range / 2.0 : current - range / 2.0;
-            reason = "Half the recent MACD range";
+            if (!found) return false;
+            level = best;
             return true;
         }
 
@@ -4172,7 +4183,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             return true;
         }
 
-        private bool ShowMacdLevelDialog(Window owner, string title, string intro, string prefill, string suggestion, out double level)
+        private bool ShowMacdLevelDialog(Window owner, string title, string intro, string prefill, string suggestion, out double level, bool absolute)
         {
             level = 0;
             bool accepted = false;
@@ -4257,7 +4268,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     errorText.Text = "Enter a MACD level.";
                     return;
                 }
-                chosen = parsed;
+                // The track window stores a magnitude. Buy and Sell apply the sign later.
+                chosen = absolute ? Math.Abs(parsed) : parsed;
                 accepted = true;
                 win.DialogResult = true;
             };
@@ -4327,21 +4339,24 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Print("KcMidTrader MACD suggestion error: " + ex.Message);
                 got = false;
             }
+            double magnitude = Math.Abs(suggested);
             string prefill = macdConfigured && !double.IsNaN(macdLevel)
-                ? FormatMacd(macdLevel)
-                : (got ? FormatMacd(suggested) : "");
+                ? FormatMacd(Math.Abs(macdLevel))
+                : (got ? FormatMacd(magnitude) : "");
             string line = got
-                ? "Suggested: " + FormatMacd(suggested) + ". " + reason + "."
-                : "MACD has no closed value yet. Type a level.";
+                ? "Suggested magnitude: " + FormatMacd(magnitude) + ". " + reason + "."
+                : "MACD has no closed value yet. Type a magnitude.";
             return ShowMacdLevelDialog(
                 chartWindow,
                 "MACD level",
-                "The order price is the Keltner midline.\n"
-                + "Buy is sent when the MACD line crosses above this level.\n"
-                + "Sell is sent when it crosses below.\n"
-                + "A cross that is already true does not send the order.\n"
-                + "A buy above the market and a sell below it wait for the same cross, then follow the midline.",
-                prefill, line, out level);
+                "Enter a magnitude. A minus sign is ignored.\n"
+                + "Buy at the Keltner midline waits for MACD to cross above this value.\n"
+                + "Sell at the Keltner midline waits for MACD to cross below this value.\n"
+                + "The order stays not filled until that later cross.\n"
+                + "The cross sends a limit at the midline and starts the selected ATM.\n"
+                + "A cross that is already true waits until MACD leaves the level and crosses again.\n"
+                + "If the midline is through the market, the limit waits until it is back on the passive side while MACD is still beyond the level.",
+                prefill, line, out level, true);
         }
 
         private static void FillBandBox(System.Windows.Controls.ComboBox band, KcSource src, int prefer)
@@ -4559,18 +4574,25 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (!row.MacdSet || pick.Source == null || pick.Source.Indicator == null)
                     return "Enter a MACD level for the " + which.ToLower() + ".";
                 bool isLong = IsBuyAction(t.Action);
-                int hit = MacdHitSign(isLong, row.IsStop);
+                double magnitude = Math.Abs(row.MacdLevel);
+                bool falls = MacdExitFalls(magnitude, isLong);
                 int sign = 0;
                 int bar = ClosedBar();
-                bool known = bar >= 0 && TryMacdSign(pick.Source.Indicator, row.MacdLevel, bar, out sign);
+                bool known = bar >= 0 && TryMacdExitSign(pick.Source.Indicator, magnitude, bar, out sign);
                 int stored = int.MinValue;
                 if (known)
                 {
-                    bool already = hit < 0 ? sign <= 0 : sign >= 0;
-                    stored = already ? hit : sign;
+                    bool already = falls ? sign <= 0 : sign >= 0;
+                    stored = already ? (falls ? -1 : 1) : sign;
                 }
-                lock (sync) { AssignMacdLeg(t, row.IsStop, pick.Source.Indicator, row.MacdLevel, stored); }
-                parts.Add(which + " will close when MACD crosses " + FormatMacd(row.MacdLevel) + ". The position stays open until then.");
+                lock (sync) { AssignMacdLeg(t, row.IsStop, pick.Source.Indicator, magnitude, stored); }
+                string how = magnitude == 0
+                    ? (isLong
+                        ? "crosses down through 0, from positive to negative"
+                        : "crosses up through 0, from negative to positive")
+                    : "absolute level falls through " + FormatMacd(magnitude);
+                parts.Add(which + " will close the " + (isLong ? "buy" : "sell")
+                    + " when MACD " + how + ". The other protective order is cancelled, then the position closes at the market.");
                 return null;
             }
             if (pick.Kind == FollowKind.Atm)
@@ -5116,15 +5138,16 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
             }
 
-            // The level was chosen when MACD was selected in Track. Buy and Sell reuse it.
-            double level;
+            // The magnitude was chosen when MACD was selected in Track. Buy and Sell reuse it.
+            double magnitude;
             if (macdConfigured && !double.IsNaN(macdLevel))
-                level = macdLevel;
+                magnitude = Math.Abs(macdLevel);
             else
             {
-                if (!PromptTrackMacd(src, out level))
+                if (!PromptTrackMacd(src, out magnitude))
                     return;
-                macdLevel = level;
+                magnitude = Math.Abs(magnitude);
+                macdLevel = magnitude;
                 macdConfigured = true;
                 shownMacdText = null;
             }
@@ -5133,6 +5156,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (acct == null) { SetStatusNow("Select an account in Chart Trader."); return; }
 
             RememberAtm();
+            bool isBuy = action == OrderAction.Buy;
+            double level = isBuy ? magnitude : -magnitude;
             int bar = ClosedBar();
             int sign = 0;
             if (bar < 0 || !TryMacdSign(src.Indicator, level, bar, out sign))
@@ -5141,10 +5166,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
             }
 
-            bool isBuy = action == OrderAction.Buy;
             int qty = ReadQty();
             string label = NewOrderLabel();
-            string levelText = FormatMacd(level);
+            string levelText = FormatMacd(magnitude);
             string lineName = string.IsNullOrWhiteSpace(selectedLineName) ? "Midline" : selectedLineName;
             int plot = ActivePlot(price);
             lock (sync)
@@ -5167,8 +5191,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 tracked.Add(t);
             }
 
-            string wait = isBuy ? "MACD to cross above " + levelText : "MACD to cross below " + levelText;
-            SetStatusNow((isBuy ? "Buy" : "Sell") + " armed at the Keltner " + lineName + ". Waiting for " + wait + ".");
+            string wait = isBuy
+                ? "MACD to cross above " + levelText
+                : "MACD to cross below " + FormatMacd(-magnitude);
+            SetStatusNow((isBuy ? "Buy" : "Sell") + " armed at the Keltner " + lineName
+                + ". Not filled until " + wait + ". The limit and ATM start on that cross.");
         }
 
         private void ReleaseMacdArms(int bar)
@@ -5189,20 +5216,42 @@ namespace NinjaTrader.NinjaScript.Indicators
                     continue;
                 }
                 t.EntryMacdNoted = false;
-                if (sign == 0 || sign == t.EntryMacdSign) continue;
                 int wanted = IsBuyAction(t.Action) ? 1 : -1;
                 if (sign != wanted)
                 {
-                    lock (sync) { t.EntryMacdSign = sign; t.EntryMacdBar = bar; }
+                    lock (sync)
+                    {
+                        t.EntryMacdSign = sign;
+                        t.EntryMacdBar = bar;
+                        t.EntryMacdAwaitLimit = false;
+                    }
                     continue;
                 }
-                string msg = SubmitArmedMacd(t, bar, sign);
+                // Already beyond the magnitude, and not waiting for a limit price: this is not a new cross.
+                if (sign == t.EntryMacdSign && !t.EntryMacdAwaitLimit) continue;
+
+                string waitReason;
+                string msg = SubmitArmedMacd(t, bar, sign, out waitReason);
+                if (waitReason != null)
+                {
+                    bool first;
+                    lock (sync)
+                    {
+                        first = !t.EntryMacdAwaitLimit;
+                        t.EntryMacdAwaitLimit = true;
+                        t.EntryMacdSign = sign;
+                        t.EntryMacdBar = bar;
+                    }
+                    if (first) SetStatus(waitReason);
+                    continue;
+                }
                 if (!string.IsNullOrEmpty(msg)) SetStatus(msg);
             }
         }
 
-        private string SubmitArmedMacd(TrackedOrder t, int bar, int sign)
+        private string SubmitArmedMacd(TrackedOrder t, int bar, int sign, out string waitReason)
         {
+            waitReason = null;
             if (t == null || t.Account == null || t.Quantity <= 0) return "Could not place the MACD entry.";
             bool isBuy = IsBuyAction(t.Action);
 
@@ -5222,31 +5271,35 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
 
             double raw;
+            string lineName = string.IsNullOrWhiteSpace(selectedLineName) ? "Midline" : selectedLineName;
             if (priceInd == null || !TryReadSeries(priceInd, pricePlot, priceBar, out raw))
             {
-                if (!t.EntryMacdNoted)
-                {
-                    t.EntryMacdNoted = true;
-                    return (t.Label ?? "Order") + "  waiting: the Keltner line has no price yet.";
-                }
+                waitReason = (t.Label ?? "Order") + " stays not filled. The Keltner " + lineName + " has no price yet.";
                 return null;
             }
-            t.EntryMacdNoted = false;
 
             double mid = Instrument.MasterInstrument.RoundToTickSize(raw);
             double price = OffsetPrice(isBuy, mid);
             double refPx = RefPrice(isBuy);
             if (double.IsNaN(refPx))
+            {
+                waitReason = (t.Label ?? "Order") + " stays not filled. No market price yet.";
                 return null;
+            }
 
-            // Same price rules as a Keltner order. The stop side is sent too: the MACD cross is the trigger,
-            // and FollowThrough keeps that order on the line afterwards.
+            // The MACD cross only releases a limit. A price through the market stays not filled
+            // until the midline is back on the passive side while MACD is still beyond the magnitude.
             OrderType? type = DesiredType(isBuy, price, refPx);
-            if (type == null)
+            if (type == null || type.Value != OrderType.Limit)
+            {
+                waitReason = (t.Label ?? "Order") + " stays not filled. MACD is beyond "
+                    + FormatMacd(Math.Abs(t.EntryMacdLevel))
+                    + ", waiting for the Keltner " + lineName + " to be a limit.";
                 return null;
+            }
 
-            double lmt = type.Value == OrderType.Limit ? price : 0;
-            double stp = type.Value == OrderType.StopMarket ? price : 0;
+            double lmt = price;
+            double stp = 0;
 
             string chosenAtm = "";
             NinjaTrader.NinjaScript.AtmStrategy atm = null;
@@ -5261,7 +5314,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             Order o;
             try
             {
-                o = t.Account.CreateOrder(Instrument, action, type.Value, OrderEntry.Manual, OrderTif, t.Quantity,
+                o = t.Account.CreateOrder(Instrument, action, OrderType.Limit, OrderEntry.Manual, OrderTif, t.Quantity,
                     lmt, stp, string.Empty, orderName, NinjaTrader.Core.Globals.MaxDate, null);
             }
             catch (Exception ex)
@@ -5317,14 +5370,14 @@ namespace NinjaTrader.NinjaScript.Indicators
             lock (sync)
             {
                 t.WaitMacd = false;
+                t.EntryMacdAwaitLimit = false;
                 t.EntryMacdSign = sign;
                 t.EntryMacdBar = bar;
             }
             RefreshAtmOwner(t);
 
-            string kind = type.Value == OrderType.Limit ? "LMT" : "STP";
-            string msg = string.Format("{0}  {1} {2} {3} @ {4} when MACD crossed {5}",
-                t.Label, isBuy ? "BUY" : "SELL", t.Quantity, kind,
+            string msg = string.Format("{0}  {1} {2} LMT @ {3} when MACD crossed {4}",
+                t.Label, isBuy ? "BUY" : "SELL", t.Quantity,
                 Instrument.MasterInstrument.FormatPrice(price), FormatMacd(t.EntryMacdLevel));
             if (t.Track) msg += " (tracking the Keltner line)";
             msg += chosenAtm.Length == 0
@@ -5349,7 +5402,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             string which = isStop ? "Stop" : "Target";
             int sign;
-            if (ind == null || !TryMacdSign(ind, level, barIndex, out sign))
+            if (ind == null || !TryMacdExitSign(ind, level, barIndex, out sign))
             {
                 if (NoteLegFlag(t, isStop, false))
                     return which + " paused: MACD has no value.";
@@ -5357,7 +5410,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
 
             bool isLong = IsBuyAction(t.Action);
-            int hit = MacdHitSign(isLong, isStop);
+            bool falls = MacdExitFalls(level, isLong);
             bool crossed = false;
             lock (sync)
             {
@@ -5365,13 +5418,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                 prev = isStop ? t.StopMacdSign : t.TargetMacdSign;
                 if (prev == int.MinValue)
                 {
-                    bool already = hit < 0 ? sign <= 0 : sign >= 0;
-                    int stored = already ? hit : sign;
+                    bool already = falls ? sign <= 0 : sign >= 0;
+                    int stored = already ? (falls ? -1 : 1) : sign;
                     if (isStop) t.StopMacdSign = stored;
                     else t.TargetMacdSign = stored;
                     return null;
                 }
-                crossed = hit < 0 ? (prev > 0 && sign <= 0) : (prev < 0 && sign >= 0);
+                crossed = falls ? (prev > 0 && sign <= 0) : (prev < 0 && sign >= 0);
                 if (!crossed && sign != 0)
                 {
                     if (isStop) t.StopMacdSign = sign;
