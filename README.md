@@ -131,7 +131,7 @@ The order type depends on which side of the market the order price (line ± offs
 | Order price on the other side of the market | **Block** (default) or **Buy Stop Market** | **Block** (default) or **Sell Stop Market** |
 | Order price exactly at the market | Not placed | Not placed |
 
-**Offset:** the buy price is `line + n ticks`, the sell price is `line − n ticks` (rounded to the tick). *Max ticks offset* (default 100) only trims a typed value in the Offset box; it is never added to the line.
+**Offset:** a signed number of ticks from **-100.00** to **100.00** (two decimal places). The buy price is `line + n ticks` and the sell price is `line − n ticks` (rounded to the tick). Positive `n` puts buys above the line and sells below it; negative `n` flips that. *Max ticks offset* (default 100) only trims the magnitude of a typed value; it is never added to the line.
 
 **Order lists:** each order gets a label like `Ord-af3658-Nov-10-26_09-31-02-114-BUY-1-NF`. Orders sit in one of three lists:
 
@@ -191,7 +191,7 @@ The order type depends on which side of the market the order price (line ± offs
 | When midband crosses market | `Block` | `Block` pauses / refuses; `SwitchToStopMarket` cancels, then re-submits as a stop (never doubled) |
 | Time in force | `GTC` | TIF for KC orders |
 | Use Chart Trader ATM strategy | `On` | KC entries launch the ATM selected in Chart Trader |
-| Max ticks offset | `100` | Ceiling for the Offset box only; a typed value above it is trimmed to it |
+| Max ticks offset | `100` | Magnitude ceiling for the Offset box (values from -100.00 to 100.00). A larger magnitude is trimmed to this setting |
 | Re-adopt working KC orders on reload | `On` | Picks up non-ATM orders named `KCMid…` again after a reload |
 
 The full step-by-step guide, with screenshots and troubleshooting, is in the manuals:
@@ -274,7 +274,7 @@ The animated demo above is an illustration made with synthetic bars; the YouTube
 | "Waiting for real-time data…" | The connection is not live yet or the market is closed; use the Sim or Playback connection |
 | "Blocked: order price … the market" | A limit there would fill immediately (line plus offset is on the wrong side). Wait, lower the offset, or set *When midband crosses market* to `SwitchToStopMarket` |
 | The Track list is greyed out or missing | Greyed: locked on the Keltner indicator by design; check **Toggle track** to pick another. Missing: *Track line* is unchecked, which hides the Track and Line rows (*Show zone* hides the Offset row) |
-| The Offset box trims my number | A value above *Max ticks offset* (100) is trimmed; raise the setting |
+| The Offset box trims my number | Values outside -100.00 to 100.00 are trimmed, and so is a magnitude above *Max ticks offset* |
 | The order does not move | Tracking is paused (see the status line), *Track mode* is `OnBarClose`, or an EMA / MACD order is still armed (it has no broker order until its cross) |
 | Orders still working after removing the indicator | By design, a reload never cancels orders. Click **Cancel KC Orders** first |
 | ATM orders not tracked after a reload | NinjaTrader names every ATM entry "Entry", so they can't be identified; cancel them from the chart or the Orders tab |

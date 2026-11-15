@@ -5,7 +5,7 @@
 //
 //  Adds a "KC MIDBAND" section to the bottom of Chart Trader that lets you:
 //    * set a quantity (default 1)
-//    * set a ticks offset from the midband (buy above, sell below; 0 keeps the mid)
+//    * set a signed offset in ticks, from -100.00 to 100.00 (positive: buy above, sell below; negative flips that; 0 keeps the line)
 //    * show or hide that offset zone (light blue above, light red below)
 //    * BUY or SELL at the selected line plus that offset with one click (Midline by default)
 //    * keep those orders ATTACHED to the offset price (they follow the selected line as it moves)
@@ -40,6 +40,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.IO;
 using System.Xml.Serialization;
 using NinjaTrader.Cbi;
 using NinjaTrader.Gui;
@@ -163,6 +164,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             public bool         ArmNoted;
             public bool         QuickEntry;       // Chart Trader Buy/Sell Mkt, Bid, or Ask; not a midline order
             public bool         QuickBracketsPlaced;
+            public IndId       StopId;
+            public IndId       TargetId;
+            public IndId       EmaAId;
+            public IndId       EmaBId;
+            public IndId       EntryMacdId;
+            public IndId       EntryPriceId;
         }
 
         private enum QuickMode
@@ -241,6 +248,88 @@ namespace NinjaTrader.NinjaScript.Indicators
             public bool   IsEmaCross;  // synthetic Track row; not a chart indicator
         }
 
+        // Identity of a chart indicator that survives the reload NinjaTrader performs when the
+        // Indicators window is applied (add, remove, or edit parameters). DisplayName includes
+        // the input parameters, so a parameter edit will not match it; the type plus the
+        // indicator's place among that type on the chart still does.
+        private struct IndId
+        {
+            public bool   Valid;
+            public string TypeName;
+            public string Display;
+            public int    Ordinal;
+        }
+
+        // One chart's Track/Line choice and the orders that must come back after this indicator
+        // is terminated and constructed again. Static state survives that reload. A compile does not.
+        private sealed class OrderPin
+        {
+            public string OrderId;
+            public string AccountName;
+            public string Label;
+            public OrderAction Action;
+            public int Quantity;
+            public bool Track;
+            public bool FollowThrough;
+            public bool FollowAtm;
+            public string AtmName;
+            public bool QuickEntry;
+            public bool Selected;
+            public bool WaitMacd;
+            public bool WaitCross;
+            public double EntryMacdLevel;
+            public int EntryMacdSign;
+            public int EntryMacdBar = -1;
+            public int EntryPricePlot;
+            public int ArmSign;
+            public int ArmBar;
+            public int EntryCrossBar = -1;
+            public LegFollow StopSource;
+            public LegFollow TargetSource;
+            public IndId StopId;
+            public IndId TargetId;
+            public IndId EmaAId;
+            public IndId EmaBId;
+            public IndId EntryMacdId;
+            public IndId EntryPriceId;
+            public int StopPlot;
+            public int TargetPlot;
+            public bool StopMacdSet;
+            public bool TargetMacdSet;
+            public double StopMacdLevel;
+            public double TargetMacdLevel;
+            public int TargetEmaSign;
+            public double Price;
+            public string OrderName;
+            public long OrderTicks;
+            public readonly List<string> StopOrderIds = new List<string>();
+            public readonly List<string> TargetOrderIds = new List<string>();
+        }
+
+        private sealed class ChartSession
+        {
+            public bool HasTrack;
+            public bool EmaCross;
+            public IndId Track;
+            public IndId Keltner;
+            public IndId EmaA;
+            public IndId EmaB;
+            public string EmaAName;
+            public string EmaBName;
+            public string LineName;
+            public int Plot = int.MinValue;
+            public bool MacdOn;
+            public double MacdLevel = double.NaN;
+            public bool PickerOn;
+            public bool Migrated;
+            public List<OrderPin> Pins = new List<OrderPin>();
+        }
+
+        private static readonly object sessionLock = new object();
+        private static readonly Dictionary<string, ChartSession> sessions = new Dictionary<string, ChartSession>();
+        private static bool durableLoaded;
+        private static string durableBody = "";
+
         private readonly object             sync    = new object();
         private readonly List<TrackedOrder> tracked = new List<TrackedOrder>();
         private readonly List<Account>      hookedAccounts = new List<Account>();
@@ -257,7 +346,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private double shownMid  = double.NaN;
         private int    shownCount = -1;
         private bool   trackAll  = true;
-        private volatile int  ticksOffset;     // Chart Trader offset, already trimmed to the ceiling
+        private const double OffsetStep = 0.05;
+        private volatile int  ticksOffsetCents; // Chart Trader offset in hundredths of a tick, within [-100.00, 100.00]
         private volatile bool showZone = true;
 
         // ---------------------------------------------------------------- UI
@@ -304,6 +394,20 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool   crossPausedNoted;
         private volatile int   selectedPlot = int.MinValue;   // int.MinValue = not chosen yet
         private string selectedLineName = "Midline";
+        private IndId trackId;
+        private IndId keltnerId;
+        private IndId emaAId;
+        private IndId emaBId;
+        private readonly object adoptGate = new object();
+        private bool   sessionReady;
+        private bool   adoptFinished;
+        private int    adoptPasses;
+        private bool   lastScanCompleted;
+        private int    lastScanOrders;
+        private bool   restoredNoted;
+        private bool   ordersRestoredNoted;
+        private bool   pickerRestored;
+        private bool   chartUiArmed;
         private bool   suppressComboEvent;
         private bool   suppressLineEvent;
         private bool   suppressLegDialog;
@@ -351,13 +455,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Historical)
             {
+                EnsureLoaded();
                 trackAll    = TrackByDefault;
-                ticksOffset = 0;
+                ticksOffsetCents = 0;
                 showZone    = true;
+                // UI clones created for the Indicators window never reach Historical.
+                // Only this configured instance may add or remove the Chart Trader panel.
+                chartUiArmed = true;
                 if (ChartControl != null)
                 {
                     ChartControl.Dispatcher.InvokeAsync(() =>
                     {
+                        if (!chartUiArmed) return;
                         CreateUi();
                         if (TabSelected())
                             InsertUi();
@@ -367,13 +476,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Realtime)
             {
-                if (AdoptExistingOrders)
-                    AdoptOrders();
+                EnsureAdopted();
                 if (ChartControl != null)
                     ChartControl.Dispatcher.InvokeAsync(() => DetectKeltner());
             }
             else if (State == State.Terminated)
             {
+                chartUiArmed = false;
                 UnhookAccounts();
                 // Orders are intentionally NOT cancelled here: indicators are reloaded often
                 // (F5, adding indicators...). Re-adoption picks them up again on reload.
@@ -405,9 +514,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             lastPrice = Close[0];
 
+            if (State == State.Realtime && !adoptFinished)
+                EnsureAdopted();
+
             if (State == State.Realtime && IsFirstTickOfBar && ChartControl != null)
                 ChartControl.Dispatcher.InvokeAsync(() =>
                 {
+                    EnsureAdopted();
                     DetectKeltner();
                     if (atmSelector == null) HookAtmSelector();
                     if (quickButtons.Count == 0) HookQuickButtons();
@@ -563,23 +676,41 @@ namespace NinjaTrader.NinjaScript.Indicators
             return px;
         }
 
-        // MaxTicksOffset is only a typing ceiling. The offset itself is the trimmed Chart Trader value.
-        private int OffsetCeiling()
+        // The Offset box accepts [-100.00, 100.00]. MaxTicksOffset can only tighten that magnitude.
+        private double OffsetMagnitudeCap()
         {
-            return Math.Max(0, MaxTicksOffset);
+            double cap = 100.0;
+            int configured = MaxTicksOffset;
+            if (configured < 0) configured = 0;
+            if (configured < cap) cap = configured;
+            return cap;
         }
 
-        private int ClampOffset(int n)
+        private double ClampOffset(double n)
         {
-            if (n < 0) return 0;
-            int ceiling = OffsetCeiling();
-            return n > ceiling ? ceiling : n;
+            if (double.IsNaN(n) || double.IsInfinity(n)) return 0;
+            double cap = OffsetMagnitudeCap();
+            n = Math.Round(n, 2, MidpointRounding.AwayFromZero);
+            if (n > cap) return cap;
+            if (n < -cap) return -cap;
+            return n;
         }
 
-        // Buy sits n ticks above the mid; sell sits n ticks below. n = 0 keeps the midband price.
+        private double CurrentOffset()
+        {
+            return ClampOffset(ticksOffsetCents / 100.0);
+        }
+
+        private static string FormatOffset(double n)
+        {
+            return n.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        // Positive n: buy sits n ticks above the line and sell sits n ticks below.
+        // Negative n flips that. 0 keeps the line price.
         private double OffsetPrice(bool isBuy, double mid)
         {
-            int n = ClampOffset(ticksOffset);
+            double n = CurrentOffset();
             double tick = TickSize;
             if (tick <= 0 || n == 0) return mid;
             double px = mid + (isBuy ? n : -n) * tick;
@@ -673,6 +804,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 tracked.Add(t);
             }
 
+            RememberOrders();
             return string.Format("{0}  {1} {2} {3} @ {4}{5}",
                 label,
                 isBuy ? "BUY" : "SELL", qty,
@@ -814,38 +946,270 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         // Picks up working orders placed by this tool before a reload/restart.
-        // (ATM entries are named "Entry" by NinjaTrader and cannot be identified, so they are not adopted.
-        // Chart Trader Mkt, Bid, and Ask orders are added only when those buttons are clicked.)
+        // ATM entries must be named "Entry", so a name prefix cannot find them. The chart
+        // session remembers their ids, including filled orders whose stop or target still
+        // follows a line. (Chart Trader Mkt, Bid, and Ask orders are added only when those
+        // buttons are clicked, unless they were already remembered.)
         private void AdoptOrders()
         {
+            lastScanCompleted = false;
+            lastScanOrders = 0;
             try
             {
+                EnsureLoaded();
+                Dictionary<string, OrderPin> byId = PinsById();
+                List<OrderPin> arms = ArmPins();
+                List<OrderPin> loosePins = LoosePins();
+                List<WorkingHit> hits = new List<WorkingHit>();
+                int added = 0;
                 lock (Account.All)
                 {
                     foreach (Account acct in Account.All)
                     {
                         Order[] orders;
                         lock (acct.Orders) orders = acct.Orders.ToArray();
+                        lastScanCompleted = true;
                         foreach (Order o in orders)
                         {
-                            if (o.Instrument == null || o.Instrument.FullName != Instrument.FullName) continue;
-                            if (o.Name == null || !o.Name.StartsWith(OrderNamePrefix)) continue;
-                            if (Order.IsTerminalState(o.OrderState)) continue;
-                            lock (sync)
+                            if (!SameInstrument(o == null ? null : o.Instrument)) continue;
+                            lastScanOrders++;
+                            OrderPin pin = null;
+                            if (!string.IsNullOrEmpty(o.OrderId))
+                                byId.TryGetValue(o.OrderId, out pin);
+                            bool named = o.Name != null && o.Name.StartsWith(OrderNamePrefix);
+                            if (pin != null || (AdoptExistingOrders && named))
                             {
-                                if (tracked.Any(x => x.Order == o)) continue;
-                                TrackedOrder t = new TrackedOrder();
-                                t.Order = o; t.Account = acct; t.Action = o.OrderAction;
-                                t.Quantity = o.Quantity; t.Track = trackAll;
-                                t.Label = LabelFromExistingOrder(o);
-                                tracked.Add(t);
-                                HookAccount(acct);
+                                if (!IsAdoptable(o, pin != null)) continue;
+                                if (TryAddAdopted(acct, o, pin)) added++;
+                                continue;
                             }
+                            if (IsOpenEntry(o))
+                                hits.Add(new WorkingHit { Account = acct, Order = o });
                         }
                     }
                 }
+                added += AdoptByPrice(loosePins, hits);
+                if (loosePins.Count == 0)
+                    added += AdoptUnpinnedEntries(hits);
+                RestoreArms(arms);
+                if (added > 0 && !ordersRestoredNoted)
+                {
+                    ordersRestoredNoted = true;
+                    Print("KcMidTrader: attached " + added + " order(s) again after the indicator reload.");
+                }
             }
             catch (Exception ex) { Print("KcMidTrader adopt error: " + ex.Message); }
+        }
+
+        private sealed class WorkingHit
+        {
+            public Account Account;
+            public Order Order;
+        }
+
+        private void EnsureAdopted()
+        {
+            if (State != State.Realtime || adoptFinished) return;
+            lock (adoptGate)
+            {
+                if (adoptFinished) return;
+                EnsureLoaded();
+                AdoptOrders();
+                sessionReady = true;
+                int missing = CountUnadoptedPins();
+                adoptPasses++;
+                bool gaveUp = lastScanCompleted && adoptPasses >= (lastScanOrders > 0 ? 8 : 40);
+                if (missing == 0 || gaveUp)
+                    adoptFinished = true;
+                if (missing == 0 || TrackedOpenCount() > 0)
+                    SavePins();
+                if (lastScanCompleted && lastScanOrders > 0)
+                    MarkMigrated();
+            }
+            SyncOrderList();
+        }
+
+        private void RememberOrders()
+        {
+            if (State != State.Realtime) return;
+            sessionReady = true;
+            SavePins();
+        }
+
+        private bool TryAddAdopted(Account acct, Order o, OrderPin pin)
+        {
+            lock (sync)
+            {
+                if (AlreadyTracked(o)) return false;
+                TrackedOrder t = pin == null ? TrackedFromName(acct, o) : TrackedFromPin(acct, o, pin);
+                if (pin == null) t.Track = trackAll;
+                tracked.Add(t);
+                NoteFill(t);
+                HookAccount(acct);
+            }
+            if (pin != null)
+                AttachPinnedChildren(pin);
+            return true;
+        }
+
+        private int AdoptByPrice(List<OrderPin> pins, List<WorkingHit> hits)
+        {
+            if (pins == null || hits == null || pins.Count == 0 || hits.Count == 0) return 0;
+            int added = 0;
+            foreach (OrderPin pin in pins)
+            {
+                if (pin == null || PinIsTracked(pin)) continue;
+                WorkingHit match = null;
+                int found = 0;
+                foreach (WorkingHit hit in hits)
+                {
+                    if (hit == null || hit.Order == null || AlreadyTracked(hit.Order)) continue;
+                    if (!PinMatchesOrder(pin, hit)) continue;
+                    match = hit;
+                    found++;
+                }
+                if (found != 1) continue;
+                if (TryAddAdopted(match.Account, match.Order, pin)) added++;
+            }
+            return added;
+        }
+
+        // First run after this build has no saved id. A working Entry on this instrument is the
+        // order the tool was moving. Later reloads use the saved id and do not grab new manual orders.
+        private int AdoptUnpinnedEntries(List<WorkingHit> hits)
+        {
+            ChartSession s = PeekSession();
+            if (s != null && s.Migrated) return 0;
+            if (hits == null || hits.Count == 0) return 0;
+            int added = 0;
+            foreach (WorkingHit hit in hits)
+            {
+                if (hit == null || hit.Order == null || AlreadyTracked(hit.Order)) continue;
+                if (TryAddAdopted(hit.Account, hit.Order, null)) added++;
+            }
+            return added;
+        }
+
+        private void MarkMigrated()
+        {
+            ChartSession s = EditSession();
+            if (s == null || s.Migrated) return;
+            lock (sessionLock) s.Migrated = true;
+            SaveDurable();
+        }
+
+        private static bool IsAdoptable(Order o, bool pinned)
+        {
+            if (o == null) return false;
+            if (o.OrderState == OrderState.Rejected) return false;
+            if (o.OrderState == OrderState.Cancelled && o.Filled <= 0) return false;
+            if (Order.IsTerminalState(o.OrderState) && o.Filled <= 0) return false;
+            if (Order.IsTerminalState(o.OrderState) && !pinned) return false;
+            return true;
+        }
+
+        private static bool IsOpenEntry(Order o)
+        {
+            if (!IsChangeable(o)) return false;
+            string name = o.Name ?? "";
+            if (name.StartsWith("Stop", StringComparison.OrdinalIgnoreCase)) return false;
+            if (name.StartsWith("Target", StringComparison.OrdinalIgnoreCase)) return false;
+            if (name.StartsWith("Close", StringComparison.OrdinalIgnoreCase)) return false;
+            bool entry = name.Equals("Entry", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith(OrderNamePrefix, StringComparison.Ordinal);
+            if (!entry) return false;
+            return o.OrderType == OrderType.Limit || o.OrderType == OrderType.StopMarket
+                || o.OrderType == OrderType.StopLimit;
+        }
+
+        private bool SameInstrument(Instrument orderInst)
+        {
+            if (orderInst == null || Instrument == null) return false;
+            if (string.Equals(orderInst.FullName, Instrument.FullName, StringComparison.Ordinal)) return true;
+            try
+            {
+                if (orderInst.MasterInstrument == null || Instrument.MasterInstrument == null) return false;
+                if (!string.Equals(orderInst.MasterInstrument.Name, Instrument.MasterInstrument.Name, StringComparison.OrdinalIgnoreCase))
+                    return false;
+                DateTime a = orderInst.Expiry;
+                DateTime b = Instrument.Expiry;
+                if (a.Year > 2000 && b.Year > 2000)
+                    return a.Year == b.Year && a.Month == b.Month;
+            }
+            catch { }
+            return false;
+        }
+
+        private bool PinMatchesOrder(OrderPin pin, WorkingHit hit)
+        {
+            Order o = hit.Order;
+            if (pin == null || o == null) return false;
+            if (!string.IsNullOrEmpty(pin.AccountName) && hit.Account != null
+                && !string.Equals(pin.AccountName, hit.Account.Name, StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (IsBuyAction(o.OrderAction) != IsBuyAction(pin.Action)) return false;
+            if (pin.Quantity > 0 && o.Quantity != pin.Quantity) return false;
+            if (!string.IsNullOrEmpty(pin.OrderName) && !string.IsNullOrEmpty(o.Name)
+                && !string.Equals(pin.OrderName, o.Name, StringComparison.OrdinalIgnoreCase))
+                return false;
+            return PriceClose(pin.Price, OrderPrice(o));
+        }
+
+        private bool PriceClose(double a, double b)
+        {
+            if (a <= 0 || b <= 0) return false;
+            double tick = TickSize > 0 ? TickSize : Instrument.MasterInstrument.TickSize;
+            if (tick <= 0) tick = 0.25;
+            return Math.Abs(a - b) <= tick * 2 + 0.0000001;
+        }
+
+        private static double OrderPrice(Order o)
+        {
+            if (o == null) return 0;
+            if ((o.OrderType == OrderType.Limit || o.OrderType == OrderType.StopLimit) && o.LimitPrice > 0)
+                return o.LimitPrice;
+            if (o.StopPrice > 0) return o.StopPrice;
+            return o.LimitPrice;
+        }
+
+        private bool PinIsTracked(OrderPin pin)
+        {
+            if (pin == null) return false;
+            lock (sync)
+            {
+                foreach (TrackedOrder t in tracked)
+                {
+                    if (t.Order == null) continue;
+                    if (!string.IsNullOrEmpty(pin.OrderId) && t.Order.OrderId == pin.OrderId) return true;
+                    if (PriceClose(pin.Price, OrderPrice(t.Order))
+                        && IsBuyAction(t.Action) == IsBuyAction(pin.Action)
+                        && t.Quantity == pin.Quantity)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        private int CountUnadoptedPins()
+        {
+            ChartSession s = PeekSession();
+            if (s == null || s.Pins == null) return 0;
+            int n = 0;
+            foreach (OrderPin pin in s.Pins)
+                if (pin != null && !PinIsTracked(pin))
+                    n++;
+            return n;
+        }
+
+        private int TrackedOpenCount()
+        {
+            lock (sync)
+            {
+                int n = 0;
+                foreach (TrackedOrder t in tracked)
+                    if (!t.Completed) n++;
+                return n;
+            }
         }
 
         private int CancelAll()
@@ -887,6 +1251,19 @@ namespace NinjaTrader.NinjaScript.Indicators
         // =================================================================================
         private void DetectKeltner()
         {
+            EnsureLoaded();
+            ChartSession remembered = PeekSession();
+            if (!pickerRestored && remembered != null)
+            {
+                pickerRestored = true;
+                if (remembered.PickerOn)
+                {
+                    trackPickerOn = true;
+                    if (toggleTrackBox != null && toggleTrackBox.IsChecked != true)
+                        toggleTrackBox.IsChecked = true;
+                }
+            }
+
             List<string> onChart = new List<string>();
             string filter = string.IsNullOrWhiteSpace(IndicatorNameFilter) ? "Keltner" : IndicatorNameFilter.Trim();
             // Track stays on the name filter unless Toggle track is on. The current choice stays listed after lock.
@@ -916,6 +1293,14 @@ namespace NinjaTrader.NinjaScript.Indicators
                 found.Add(cross);
             }
 
+            ChartSession memory = PeekSession();
+            if (memory != null && memory.HasTrack && !memory.EmaCross)
+            {
+                KcSource saved = FindSource(all, memory.Track);
+                if (saved != null && SameSource(found, saved) == null)
+                    found.Add(saved);
+            }
+
             // Rebuild the selector only if the set of indicators (or their settings/labels) changed.
             bool changed = found.Count != kcList.Count;
             if (!changed)
@@ -925,26 +1310,63 @@ namespace NinjaTrader.NinjaScript.Indicators
                         || found[i].Label != kcList[i].Label)
                     { changed = true; break; }
 
-            if (changed)
+            if (changed || selectedKc == null)
             {
                 KcSource prev = selectedKc;
                 bool wasCross = prev != null && prev.IsEmaCross;
                 kcList = found;
-                // Keep the user's choice if that indicator is still on the chart; otherwise use the first listed.
+                // Keep the user's choice if that indicator object is still on the chart.
                 KcSource keep = null;
                 if (wasCross)
                     keep = kcList.FirstOrDefault(x => x.IsEmaCross);
                 else if (prev != null)
                     keep = kcList.FirstOrDefault(x => !x.IsEmaCross && ReferenceEquals(x.Indicator, prev.Indicator));
+
+                // Apply/OK on the Indicators window replaces every indicator object. Match the
+                // saved type and chart slot so Track and Line stay on the line the orders used.
+                bool fromMemory = false;
+                if (keep == null && memory != null && memory.HasTrack)
+                {
+                    if (memory.EmaCross)
+                        keep = kcList.FirstOrDefault(x => x.IsEmaCross);
+                    else
+                        keep = SameSource(kcList, FindSource(all, memory.Track));
+                    fromMemory = keep != null;
+                }
+                if (keep == null && memory != null && memory.HasTrack
+                    && (SavedIndicatorStillPresent(memory) || !ChartHasOtherIndicators()))
+                {
+                    // The saved indicator is not readable yet, or the chart list is mid-reload.
+                    // Do not point working orders at a different line, and do not forget the saved one.
+                    selectedKc = prev;
+                    kcFound = prev != null;
+                    ShowPanel();
+                    return;
+                }
+
                 selectedKc = keep ?? (kcList.Count > 0 ? kcList[0] : null);
-                if (wasCross && (selectedKc == null || !selectedKc.IsEmaCross))
+                if ((wasCross || fromMemory && memory != null && memory.EmaCross)
+                    && (selectedKc == null || !selectedKc.IsEmaCross))
                     lastMid = double.NaN;
+                if (fromMemory)
+                    RestoreMemorySettings(memory, all);
                 RememberKeltner();
                 RefreshCombo();
+                if (fromMemory)
+                    ApplyMemoryLine(memory);
                 RefreshLineCombo(keep == null);
+                if (fromMemory && !restoredNoted)
+                {
+                    restoredNoted = true;
+                    Print("KcMidTrader: restored " + (selectedKc == null ? "Track" : selectedKc.Label)
+                        + " / " + selectedLineName + ".");
+                }
             }
 
             kcFound = selectedKc != null;
+            if (memory != null && memory.HasTrack
+                && ((memory.EmaCross && !crossConfigured) || (memory.MacdOn && !macdConfigured) || (memory.Keltner.Valid && keltnerIndicator == null)))
+                RestoreMemorySettings(memory, all);
             RememberKeltner();
 
             // Help in the NinjaScript Output window when nothing matches.
@@ -954,9 +1376,863 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (diag != null && diag != lastDiagnostic) Print(diag);
             lastDiagnostic = diag;
 
-            if (panel != null)
-                panel.Visibility = kcFound ? Visibility.Visible : Visibility.Collapsed;
+            ShowPanel();
+            RebindTrackedIndicators(all);
+            CaptureChartIds();
+            SaveSelection();
+            SavePins();
             RememberAtm();
+        }
+
+        private void ShowPanel()
+        {
+            if (panel == null) return;
+            int openOrders;
+            lock (sync) openOrders = tracked.Count;
+            // Keep Cancel reachable while orders are open, even if the line is briefly unreadable.
+            panel.Visibility = (kcFound || openOrders > 0) ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private string ChartKey()
+        {
+            if (Instrument == null || string.IsNullOrEmpty(Instrument.FullName)) return null;
+            string period = "";
+            try
+            {
+                if (BarsPeriod != null)
+                    period = BarsPeriod.BarsPeriodType.ToString() + ":"
+                        + BarsPeriod.Value.ToString(CultureInfo.InvariantCulture);
+            }
+            catch { period = ""; }
+            return Instrument.FullName + "|" + period;
+        }
+
+        private ChartSession PeekSession()
+        {
+            EnsureLoaded();
+            string key = ChartKey();
+            if (key == null) return null;
+            lock (sessionLock)
+            {
+                ChartSession s;
+                sessions.TryGetValue(key, out s);
+                return s;
+            }
+        }
+
+        private ChartSession EditSession()
+        {
+            EnsureLoaded();
+            string key = ChartKey();
+            if (key == null) return null;
+            lock (sessionLock)
+            {
+                ChartSession s;
+                if (!sessions.TryGetValue(key, out s) || s == null)
+                {
+                    s = new ChartSession();
+                    sessions[key] = s;
+                }
+                return s;
+            }
+        }
+
+        private static string SessionPath()
+        {
+            string root = NinjaTrader.Core.Globals.UserDataDir;
+            if (string.IsNullOrEmpty(root)) root = ".";
+            return Path.Combine(root, "bin", "Custom", "KcMidTrader.restore.txt");
+        }
+
+        private void EnsureLoaded()
+        {
+            if (durableLoaded) return;
+            lock (sessionLock)
+            {
+                if (durableLoaded) return;
+                durableLoaded = true;
+                try
+                {
+                    string path = SessionPath();
+                    if (!File.Exists(path)) return;
+                    string body = File.ReadAllText(path);
+                    durableBody = body;
+                    ParseSessions(body);
+                }
+                catch (Exception ex) { Print("KcMidTrader restore read error: " + ex.Message); }
+            }
+        }
+
+        private void SaveDurable()
+        {
+            try
+            {
+                string body;
+                lock (sessionLock)
+                {
+                    body = SerializeSessions();
+                    if (body == durableBody) return;
+                    durableBody = body;
+                }
+                string path = SessionPath();
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+                File.WriteAllText(path, body);
+            }
+            catch (Exception ex) { Print("KcMidTrader restore write error: " + ex.Message); }
+        }
+
+        private static string SerializeSessions()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("KC3");
+            foreach (KeyValuePair<string, ChartSession> pair in sessions)
+            {
+                ChartSession s = pair.Value;
+                if (s == null || string.IsNullOrEmpty(pair.Key)) continue;
+                sb.Append('@').AppendLine(pair.Key);
+                sb.Append("H=").AppendLine(s.HasTrack ? "1" : "0");
+                sb.Append("X=").AppendLine(s.EmaCross ? "1" : "0");
+                sb.Append("T=").AppendLine(IdText(s.Track));
+                sb.Append("K=").AppendLine(IdText(s.Keltner));
+                sb.Append("EA=").AppendLine(IdText(s.EmaA));
+                sb.Append("EB=").AppendLine(IdText(s.EmaB));
+                sb.Append("EN=").Append(s.EmaAName ?? "").Append('\x1f').AppendLine(s.EmaBName ?? "");
+                sb.Append("L=").AppendLine(s.LineName ?? "");
+                sb.Append("P=").AppendLine(s.Plot.ToString(CultureInfo.InvariantCulture));
+                sb.Append("MD=").Append(s.MacdOn ? "1" : "0").Append('\x1f')
+                    .AppendLine(s.MacdLevel.ToString(CultureInfo.InvariantCulture));
+                sb.Append("PK=").AppendLine(s.PickerOn ? "1" : "0");
+                sb.Append("MG=").AppendLine(s.Migrated ? "1" : "0");
+                if (s.Pins == null) continue;
+                foreach (OrderPin pin in s.Pins)
+                {
+                    if (pin == null) continue;
+                    sb.Append("PIN=").AppendLine(PinText(pin));
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static void ParseSessions(string body)
+        {
+            if (string.IsNullOrEmpty(body)) return;
+            ChartSession current = null;
+            string key = null;
+            string[] lines = body.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            foreach (string raw in lines)
+            {
+                if (string.IsNullOrEmpty(raw) || raw == "KC3") continue;
+                if (raw[0] == '@')
+                {
+                    StoreParsed(key, current);
+                    key = raw.Substring(1);
+                    current = new ChartSession();
+                    continue;
+                }
+                if (current == null) continue;
+                int eq = raw.IndexOf('=');
+                if (eq <= 0) continue;
+                string name = raw.Substring(0, eq);
+                string value = raw.Substring(eq + 1);
+                if (name == "H") current.HasTrack = value == "1";
+                else if (name == "X") current.EmaCross = value == "1";
+                else if (name == "T") current.Track = ParseId(value);
+                else if (name == "K") current.Keltner = ParseId(value);
+                else if (name == "EA") current.EmaA = ParseId(value);
+                else if (name == "EB") current.EmaB = ParseId(value);
+                else if (name == "EN")
+                {
+                    string[] names = value.Split('\x1f');
+                    current.EmaAName = names.Length > 0 ? names[0] : "";
+                    current.EmaBName = names.Length > 1 ? names[1] : "";
+                }
+                else if (name == "L") current.LineName = value;
+                else if (name == "P")
+                {
+                    int plot;
+                    if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out plot))
+                        current.Plot = plot;
+                }
+                else if (name == "MD")
+                {
+                    string[] parts = value.Split('\x1f');
+                    current.MacdOn = parts.Length > 0 && parts[0] == "1";
+                    double level;
+                    if (parts.Length > 1 && double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out level))
+                        current.MacdLevel = level;
+                }
+                else if (name == "PK") current.PickerOn = value == "1";
+                else if (name == "MG") current.Migrated = value == "1";
+                else if (name == "PIN")
+                {
+                    OrderPin pin = ParsePin(value);
+                    if (pin != null) current.Pins.Add(pin);
+                }
+            }
+            StoreParsed(key, current);
+        }
+
+        private static void StoreParsed(string key, ChartSession parsed)
+        {
+            if (string.IsNullOrEmpty(key) || parsed == null) return;
+            ChartSession existing;
+            if (sessions.TryGetValue(key, out existing) && existing != null
+                && (existing.HasTrack || (existing.Pins != null && existing.Pins.Count > 0)))
+                return;
+            sessions[key] = parsed;
+        }
+
+        private static string IdText(IndId id)
+        {
+            if (!id.Valid) return "-";
+            return id.Ordinal.ToString(CultureInfo.InvariantCulture) + "\x1f" + (id.TypeName ?? "") + "\x1f" + (id.Display ?? "");
+        }
+
+        private static IndId ParseId(string text)
+        {
+            IndId id = new IndId();
+            if (string.IsNullOrEmpty(text) || text == "-") return id;
+            string[] parts = text.Split('\x1f');
+            if (parts.Length < 3) return id;
+            int ordinal;
+            if (!int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out ordinal)) return id;
+            id.Valid = true;
+            id.Ordinal = ordinal;
+            id.TypeName = parts[1];
+            id.Display = parts[2];
+            return id;
+        }
+
+        private static string PinText(OrderPin pin)
+        {
+            string[] f = new string[40];
+            f[0] = pin.OrderId ?? "";
+            f[1] = pin.AccountName ?? "";
+            f[2] = pin.Label ?? "";
+            f[3] = ((int)pin.Action).ToString(CultureInfo.InvariantCulture);
+            f[4] = pin.Quantity.ToString(CultureInfo.InvariantCulture);
+            f[5] = pin.Track ? "1" : "0";
+            f[6] = pin.FollowThrough ? "1" : "0";
+            f[7] = pin.FollowAtm ? "1" : "0";
+            f[8] = pin.AtmName ?? "";
+            f[9] = pin.QuickEntry ? "1" : "0";
+            f[10] = pin.Selected ? "1" : "0";
+            f[11] = pin.WaitMacd ? "1" : "0";
+            f[12] = pin.WaitCross ? "1" : "0";
+            f[13] = pin.EntryMacdLevel.ToString(CultureInfo.InvariantCulture);
+            f[14] = pin.EntryMacdSign.ToString(CultureInfo.InvariantCulture);
+            f[15] = pin.EntryMacdBar.ToString(CultureInfo.InvariantCulture);
+            f[16] = pin.EntryPricePlot.ToString(CultureInfo.InvariantCulture);
+            f[17] = pin.ArmSign.ToString(CultureInfo.InvariantCulture);
+            f[18] = pin.ArmBar.ToString(CultureInfo.InvariantCulture);
+            f[19] = pin.EntryCrossBar.ToString(CultureInfo.InvariantCulture);
+            f[20] = ((int)pin.StopSource).ToString(CultureInfo.InvariantCulture);
+            f[21] = ((int)pin.TargetSource).ToString(CultureInfo.InvariantCulture);
+            f[22] = IdText(pin.StopId);
+            f[23] = IdText(pin.TargetId);
+            f[24] = IdText(pin.EmaAId);
+            f[25] = IdText(pin.EmaBId);
+            f[26] = IdText(pin.EntryMacdId);
+            f[27] = IdText(pin.EntryPriceId);
+            f[28] = pin.StopPlot.ToString(CultureInfo.InvariantCulture);
+            f[29] = pin.TargetPlot.ToString(CultureInfo.InvariantCulture);
+            f[30] = pin.StopMacdSet ? "1" : "0";
+            f[31] = pin.TargetMacdSet ? "1" : "0";
+            f[32] = pin.StopMacdLevel.ToString(CultureInfo.InvariantCulture);
+            f[33] = pin.TargetMacdLevel.ToString(CultureInfo.InvariantCulture);
+            f[34] = pin.TargetEmaSign.ToString(CultureInfo.InvariantCulture);
+            f[35] = pin.Price.ToString(CultureInfo.InvariantCulture);
+            f[36] = pin.OrderName ?? "";
+            f[37] = pin.OrderTicks.ToString(CultureInfo.InvariantCulture);
+            f[38] = string.Join(",", pin.StopOrderIds.ToArray());
+            f[39] = string.Join(",", pin.TargetOrderIds.ToArray());
+            return string.Join("\x1e", f);
+        }
+
+        private static OrderPin ParsePin(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            string[] f = text.Split('\x1e');
+            if (f.Length < 36) return null;
+            OrderPin pin = new OrderPin();
+            pin.OrderId = f[0];
+            pin.AccountName = f[1];
+            pin.Label = f[2];
+            int action;
+            if (int.TryParse(f[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out action)
+                && Enum.IsDefined(typeof(OrderAction), action))
+                pin.Action = (OrderAction)action;
+            int qty;
+            if (int.TryParse(f[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out qty))
+                pin.Quantity = qty;
+            pin.Track = f[5] == "1";
+            pin.FollowThrough = f[6] == "1";
+            pin.FollowAtm = f[7] == "1";
+            pin.AtmName = f[8];
+            pin.QuickEntry = f[9] == "1";
+            pin.Selected = f[10] == "1";
+            pin.WaitMacd = f[11] == "1";
+            pin.WaitCross = f[12] == "1";
+            double level;
+            if (double.TryParse(f[13], NumberStyles.Float, CultureInfo.InvariantCulture, out level))
+                pin.EntryMacdLevel = level;
+            int n;
+            if (int.TryParse(f[14], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.EntryMacdSign = n;
+            if (int.TryParse(f[15], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.EntryMacdBar = n;
+            if (int.TryParse(f[16], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.EntryPricePlot = n;
+            if (int.TryParse(f[17], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.ArmSign = n;
+            if (int.TryParse(f[18], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.ArmBar = n;
+            if (int.TryParse(f[19], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.EntryCrossBar = n;
+            pin.StopSource = LegOf(f[20]);
+            pin.TargetSource = LegOf(f[21]);
+            pin.StopId = ParseId(f[22]);
+            pin.TargetId = ParseId(f[23]);
+            pin.EmaAId = ParseId(f[24]);
+            pin.EmaBId = ParseId(f[25]);
+            pin.EntryMacdId = ParseId(f[26]);
+            pin.EntryPriceId = ParseId(f[27]);
+            if (int.TryParse(f[28], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.StopPlot = n;
+            if (int.TryParse(f[29], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.TargetPlot = n;
+            pin.StopMacdSet = f[30] == "1";
+            pin.TargetMacdSet = f[31] == "1";
+            if (double.TryParse(f[32], NumberStyles.Float, CultureInfo.InvariantCulture, out level)) pin.StopMacdLevel = level;
+            if (double.TryParse(f[33], NumberStyles.Float, CultureInfo.InvariantCulture, out level)) pin.TargetMacdLevel = level;
+            if (int.TryParse(f[34], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.TargetEmaSign = n;
+            if (double.TryParse(f[35], NumberStyles.Float, CultureInfo.InvariantCulture, out level)) pin.Price = level;
+            if (f.Length > 36) pin.OrderName = f[36];
+            long ticks;
+            if (f.Length > 37 && long.TryParse(f[37], NumberStyles.Integer, CultureInfo.InvariantCulture, out ticks))
+                pin.OrderTicks = ticks;
+            if (f.Length > 38) SplitIds(f[38], pin.StopOrderIds);
+            if (f.Length > 39) SplitIds(f[39], pin.TargetOrderIds);
+            return pin;
+        }
+
+        private static LegFollow LegOf(string text)
+        {
+            int n;
+            if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) return LegFollow.Atm;
+            if (!Enum.IsDefined(typeof(LegFollow), n)) return LegFollow.Atm;
+            return (LegFollow)n;
+        }
+
+        private static void SplitIds(string text, List<string> into)
+        {
+            if (string.IsNullOrEmpty(text) || into == null) return;
+            string[] parts = text.Split(',');
+            foreach (string part in parts)
+                if (!string.IsNullOrEmpty(part) && !into.Contains(part))
+                    into.Add(part);
+        }
+
+        private bool SavedIndicatorStillPresent(ChartSession memory)
+        {
+            if (memory == null || ChartControl == null || ChartControl.Indicators == null) return false;
+            if (memory.EmaCross) return emaOnChart >= 2;
+            if (!memory.Track.Valid || string.IsNullOrEmpty(memory.Track.TypeName)) return false;
+            try
+            {
+                foreach (var item in ChartControl.Indicators)
+                {
+                    NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind =
+                        item as NinjaTrader.Gui.NinjaScript.IndicatorRenderBase;
+                    if (ind == null || ReferenceEquals(ind, this)) continue;
+                    if (string.Equals(ind.GetType().Name, memory.Track.TypeName, StringComparison.Ordinal))
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private bool ChartHasOtherIndicators()
+        {
+            if (ChartControl == null || ChartControl.Indicators == null) return false;
+            try
+            {
+                foreach (var item in ChartControl.Indicators)
+                {
+                    NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind =
+                        item as NinjaTrader.Gui.NinjaScript.IndicatorRenderBase;
+                    if (ind != null && !ReferenceEquals(ind, this)) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static KcSource SameSource(List<KcSource> list, KcSource src)
+        {
+            if (list == null || src == null) return null;
+            if (src.IsEmaCross)
+            {
+                foreach (KcSource k in list)
+                    if (k.IsEmaCross) return k;
+                return null;
+            }
+            foreach (KcSource k in list)
+                if (!k.IsEmaCross && ReferenceEquals(k.Indicator, src.Indicator))
+                    return k;
+            return null;
+        }
+
+        private KcSource FindSource(List<KcSource> list, IndId id)
+        {
+            if (!id.Valid || list == null || string.IsNullOrEmpty(id.TypeName)) return null;
+            List<KcSource> same = new List<KcSource>();
+            foreach (KcSource k in list)
+            {
+                if (k == null || k.IsEmaCross || k.Indicator == null) continue;
+                string type;
+                try { type = k.Indicator.GetType().Name; }
+                catch { continue; }
+                if (!string.Equals(type, id.TypeName, StringComparison.Ordinal)) continue;
+                same.Add(k);
+            }
+            if (same.Count == 0) return null;
+            if (!string.IsNullOrEmpty(id.Display))
+            {
+                int hits = 0;
+                KcSource match = null;
+                foreach (KcSource k in same)
+                {
+                    if (!string.Equals(SafeDisplayName(k.Indicator), id.Display, StringComparison.Ordinal)) continue;
+                    hits++;
+                    match = k;
+                }
+                if (hits == 1) return match;
+            }
+            if (id.Ordinal >= 0 && id.Ordinal < same.Count) return same[id.Ordinal];
+            return same.Count == 1 ? same[0] : null;
+        }
+
+        private bool IsOnChart(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
+        {
+            if (ind == null || ChartControl == null || ChartControl.Indicators == null) return false;
+            try
+            {
+                foreach (var item in ChartControl.Indicators)
+                    if (ReferenceEquals(item, ind)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private int OrdinalOf(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
+        {
+            if (ind == null || ChartControl == null || ChartControl.Indicators == null) return 0;
+            string type;
+            try { type = ind.GetType().Name; }
+            catch { return 0; }
+            int n = 0;
+            try
+            {
+                foreach (var item in ChartControl.Indicators)
+                {
+                    NinjaTrader.Gui.NinjaScript.IndicatorRenderBase other =
+                        item as NinjaTrader.Gui.NinjaScript.IndicatorRenderBase;
+                    if (other == null || other.GetType().Name != type) continue;
+                    if (ReferenceEquals(other, ind)) return n;
+                    n++;
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        private IndId IdOf(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, IndId prior)
+        {
+            if (ind == null || !IsOnChart(ind)) return prior;
+            try
+            {
+                IndId id = new IndId();
+                id.Valid = true;
+                id.TypeName = ind.GetType().Name;
+                id.Display = SafeDisplayName(ind);
+                id.Ordinal = OrdinalOf(ind);
+                return id;
+            }
+            catch { return prior; }
+        }
+
+        private void ApplyMemoryLine(ChartSession memory)
+        {
+            if (memory == null) return;
+            if (!string.IsNullOrEmpty(memory.LineName))
+                selectedLineName = memory.LineName;
+            selectedPlot = memory.Plot;
+        }
+
+        private void RestoreMemorySettings(ChartSession memory, List<KcSource> all)
+        {
+            if (memory == null) return;
+            keltnerId = memory.Keltner;
+            if (memory.EmaCross)
+            {
+                KcSource a = FindSource(all, memory.EmaA);
+                KcSource b = FindSource(all, memory.EmaB);
+                if (a != null && b != null && !ReferenceEquals(a.Indicator, b.Indicator))
+                {
+                    crossEmaA = a.Indicator;
+                    crossEmaB = b.Indicator;
+                    emaAId = memory.EmaA;
+                    emaBId = memory.EmaB;
+                    crossEmaAName = string.IsNullOrEmpty(memory.EmaAName) ? SafeDisplayName(a.Indicator) : memory.EmaAName;
+                    crossEmaBName = string.IsNullOrEmpty(memory.EmaBName) ? SafeDisplayName(b.Indicator) : memory.EmaBName;
+                    crossConfigured = true;
+                }
+            }
+            if (memory.MacdOn && !double.IsNaN(memory.MacdLevel))
+            {
+                macdLevel = memory.MacdLevel;
+                macdConfigured = true;
+            }
+        }
+
+        private void CaptureChartIds()
+        {
+            if (selectedKc != null && selectedKc.IsEmaCross)
+                trackId = new IndId();
+            else if (selectedKc != null)
+                trackId = IdOf(selectedKc.Indicator, trackId);
+            if (keltnerIndicator != null)
+                keltnerId = IdOf(keltnerIndicator, keltnerId);
+            if (crossEmaA != null) emaAId = IdOf(crossEmaA, emaAId);
+            if (crossEmaB != null) emaBId = IdOf(crossEmaB, emaBId);
+            lock (sync)
+            {
+                foreach (TrackedOrder t in tracked)
+                {
+                    t.StopId = IdOf(t.StopIndicator, t.StopId);
+                    t.TargetId = IdOf(t.TargetIndicator, t.TargetId);
+                    t.EmaAId = IdOf(t.TargetEmaA, t.EmaAId);
+                    t.EmaBId = IdOf(t.TargetEmaB, t.EmaBId);
+                    t.EntryMacdId = IdOf(t.EntryMacd, t.EntryMacdId);
+                    t.EntryPriceId = IdOf(t.EntryPriceInd, t.EntryPriceId);
+                }
+            }
+        }
+
+        private void SaveSelection()
+        {
+            if (!chartUiArmed) return;
+            ChartSession s = EditSession();
+            if (s == null) return;
+            bool cross = selectedKc != null && selectedKc.IsEmaCross;
+            bool has = cross || trackId.Valid || (selectedKc != null && selectedKc.Indicator != null);
+            // A reload can run before the saved indicator is readable. Do not replace it with "no selection".
+            if (!has) return;
+            lock (sessionLock)
+            {
+                s.HasTrack = true;
+                s.EmaCross = cross;
+                s.Track = trackId;
+                s.Keltner = keltnerId;
+                s.EmaA = emaAId;
+                s.EmaB = emaBId;
+                s.EmaAName = crossEmaAName;
+                s.EmaBName = crossEmaBName;
+                s.LineName = selectedLineName;
+                s.Plot = selectedPlot;
+                s.MacdOn = macdConfigured && selectedKc != null && IsMacd(selectedKc);
+                if (s.MacdOn) s.MacdLevel = macdLevel;
+                s.PickerOn = trackPickerOn;
+            }
+            SaveDurable();
+        }
+
+        private void SavePins()
+        {
+            if (!sessionReady) return;
+            ChartSession s = EditSession();
+            if (s == null) return;
+            List<OrderPin> pins = new List<OrderPin>();
+            lock (sync)
+            {
+                foreach (TrackedOrder t in tracked)
+                {
+                    if (t.Completed) continue;
+                    bool armed = t.Order == null && (t.WaitMacd || t.WaitCross);
+                    if (!armed && t.Order == null) continue;
+                    OrderPin pin = new OrderPin();
+                    pin.OrderId = t.Order == null || t.Order.OrderId == null ? "" : t.Order.OrderId;
+                    pin.AccountName = t.Account == null ? "" : t.Account.Name;
+                    pin.Label = t.Label;
+                    pin.Action = t.Action;
+                    pin.Quantity = t.Quantity;
+                    pin.Track = t.Track;
+                    pin.FollowThrough = t.FollowThrough;
+                    pin.FollowAtm = t.FollowAtm;
+                    pin.AtmName = t.AtmName;
+                    pin.QuickEntry = t.QuickEntry;
+                    pin.Selected = t.SelectedForAtm;
+                    pin.WaitMacd = t.WaitMacd;
+                    pin.WaitCross = t.WaitCross;
+                    pin.EntryMacdLevel = t.EntryMacdLevel;
+                    pin.EntryMacdSign = t.EntryMacdSign;
+                    pin.EntryMacdBar = t.EntryMacdBar;
+                    pin.EntryPricePlot = t.EntryPricePlot;
+                    pin.ArmSign = t.ArmSign;
+                    pin.ArmBar = t.ArmBar;
+                    pin.EntryCrossBar = t.EntryCrossBar;
+                    pin.StopSource = t.StopSource;
+                    pin.TargetSource = t.TargetSource;
+                    pin.StopId = t.StopId;
+                    pin.TargetId = t.TargetId;
+                    pin.EmaAId = t.EmaAId;
+                    pin.EmaBId = t.EmaBId;
+                    pin.EntryMacdId = t.EntryMacdId;
+                    pin.EntryPriceId = t.EntryPriceId;
+                    pin.StopPlot = t.StopPlot;
+                    pin.TargetPlot = t.TargetPlot;
+                    pin.StopMacdSet = t.StopMacdSet;
+                    pin.TargetMacdSet = t.TargetMacdSet;
+                    pin.StopMacdLevel = t.StopMacdLevel;
+                    pin.TargetMacdLevel = t.TargetMacdLevel;
+                    pin.TargetEmaSign = t.TargetEmaSign;
+                    pin.Price = OrderPrice(t.Order);
+                    pin.OrderName = t.Order == null ? "" : (t.Order.Name ?? "");
+                    try { pin.OrderTicks = t.Order == null ? 0 : t.Order.Time.Ticks; }
+                    catch { pin.OrderTicks = 0; }
+                    CopyOrderIds(t.StopOrders, pin.StopOrderIds);
+                    CopyOrderIds(t.TargetOrders, pin.TargetOrderIds);
+                    pins.Add(pin);
+                }
+            }
+            lock (sessionLock)
+            {
+                if (pins.Count == 0 && s.Pins != null && s.Pins.Count > 0 && !adoptFinished)
+                    return;
+                s.Pins = pins;
+            }
+            SaveDurable();
+        }
+
+        private static void CopyOrderIds(List<Order> orders, List<string> ids)
+        {
+            if (orders == null) return;
+            foreach (Order o in orders)
+            {
+                if (o == null || string.IsNullOrEmpty(o.OrderId) || Order.IsTerminalState(o.OrderState)) continue;
+                if (!ids.Contains(o.OrderId)) ids.Add(o.OrderId);
+            }
+        }
+
+        private void RebindTrackedIndicators(List<KcSource> all)
+        {
+            lock (sync)
+            {
+                foreach (TrackedOrder t in tracked)
+                {
+                    KcSource src;
+                    if (t.StopSource == LegFollow.Indicator || t.StopSource == LegFollow.Macd)
+                    {
+                        src = FindSource(all, t.StopId);
+                        if (src != null) t.StopIndicator = src.Indicator;
+                    }
+                    if (t.TargetSource == LegFollow.Indicator || t.TargetSource == LegFollow.Macd)
+                    {
+                        src = FindSource(all, t.TargetId);
+                        if (src != null) t.TargetIndicator = src.Indicator;
+                    }
+                    if (t.TargetSource == LegFollow.EmaCross)
+                    {
+                        src = FindSource(all, t.EmaAId);
+                        if (src != null) t.TargetEmaA = src.Indicator;
+                        src = FindSource(all, t.EmaBId);
+                        if (src != null) t.TargetEmaB = src.Indicator;
+                    }
+                    if (t.WaitMacd || t.EntryMacdId.Valid)
+                    {
+                        src = FindSource(all, t.EntryMacdId);
+                        if (src != null) t.EntryMacd = src.Indicator;
+                    }
+                    if (t.EntryPriceId.Valid)
+                    {
+                        src = FindSource(all, t.EntryPriceId);
+                        if (src != null)
+                        {
+                            t.EntryPriceInd = src.Indicator;
+                            if (t.EntryPricePlot == int.MinValue) t.EntryPricePlot = src.MidPlot;
+                        }
+                    }
+                }
+            }
+        }
+
+        private Dictionary<string, OrderPin> PinsById()
+        {
+            Dictionary<string, OrderPin> map = new Dictionary<string, OrderPin>();
+            ChartSession s = PeekSession();
+            if (s == null || s.Pins == null) return map;
+            foreach (OrderPin pin in s.Pins)
+            {
+                if (pin == null || string.IsNullOrEmpty(pin.OrderId) || map.ContainsKey(pin.OrderId)) continue;
+                map[pin.OrderId] = pin;
+            }
+            return map;
+        }
+
+        private List<OrderPin> ArmPins()
+        {
+            List<OrderPin> arms = new List<OrderPin>();
+            ChartSession s = PeekSession();
+            if (s == null || s.Pins == null) return arms;
+            foreach (OrderPin pin in s.Pins)
+                if (pin != null && string.IsNullOrEmpty(pin.OrderId) && (pin.WaitMacd || pin.WaitCross))
+                    arms.Add(pin);
+            return arms;
+        }
+
+        private List<OrderPin> LoosePins()
+        {
+            List<OrderPin> pins = new List<OrderPin>();
+            ChartSession s = PeekSession();
+            if (s == null || s.Pins == null) return pins;
+            foreach (OrderPin pin in s.Pins)
+            {
+                if (pin == null || pin.WaitMacd || pin.WaitCross || PinIsTracked(pin)) continue;
+                pins.Add(pin);
+            }
+            return pins;
+        }
+
+        private bool AlreadyTracked(Order o)
+        {
+            if (o == null) return false;
+            foreach (TrackedOrder t in tracked)
+            {
+                if (t.Order == null) continue;
+                if (ReferenceEquals(t.Order, o)) return true;
+                if (!string.IsNullOrEmpty(o.OrderId) && t.Order.OrderId == o.OrderId) return true;
+            }
+            return false;
+        }
+
+        private TrackedOrder TrackedFromName(Account acct, Order o)
+        {
+            TrackedOrder t = new TrackedOrder();
+            t.Order = o;
+            t.Account = acct;
+            t.Track = trackAll;
+            if (o == null) return t;
+            t.Action = o.OrderAction;
+            t.Quantity = o.Quantity;
+            t.Label = LabelFromExistingOrder(o);
+            return t;
+        }
+
+        private TrackedOrder TrackedFromPin(Account acct, Order o, OrderPin pin)
+        {
+            TrackedOrder t = TrackedFromName(acct, o);
+            if (pin == null) return t;
+            if (!string.IsNullOrEmpty(pin.Label)) t.Label = pin.Label;
+            t.Track = pin.Track;
+            t.FollowThrough = pin.FollowThrough;
+            t.FollowAtm = pin.FollowAtm;
+            t.AtmName = pin.AtmName;
+            t.QuickEntry = pin.QuickEntry;
+            t.SelectedForAtm = pin.Selected;
+            t.WaitMacd = pin.WaitMacd && o == null;
+            t.WaitCross = pin.WaitCross && o == null;
+            t.EntryMacdLevel = pin.EntryMacdLevel;
+            t.EntryMacdSign = pin.EntryMacdSign;
+            t.EntryMacdBar = pin.EntryMacdBar;
+            t.EntryPricePlot = pin.EntryPricePlot;
+            t.ArmSign = pin.ArmSign;
+            t.ArmBar = pin.ArmBar;
+            t.EntryCrossBar = pin.EntryCrossBar;
+            t.StopSource = pin.StopSource;
+            t.TargetSource = pin.TargetSource;
+            t.StopId = pin.StopId;
+            t.TargetId = pin.TargetId;
+            t.EmaAId = pin.EmaAId;
+            t.EmaBId = pin.EmaBId;
+            t.EntryMacdId = pin.EntryMacdId;
+            t.EntryPriceId = pin.EntryPriceId;
+            t.StopPlot = pin.StopPlot;
+            t.TargetPlot = pin.TargetPlot;
+            t.StopMacdSet = pin.StopMacdSet;
+            t.TargetMacdSet = pin.TargetMacdSet;
+            t.StopMacdLevel = pin.StopMacdLevel;
+            t.TargetMacdLevel = pin.TargetMacdLevel;
+            t.TargetEmaSign = pin.TargetEmaSign;
+            if (pin.Quantity > 0) t.Quantity = pin.Quantity;
+            t.Action = pin.Action;
+            bool selected;
+            if (checkedLabels.TryGetValue(t.Label ?? "", out selected))
+                t.SelectedForAtm = selected;
+            return t;
+        }
+
+        private void AttachPinnedChildren(OrderPin pin)
+        {
+            if (pin == null || string.IsNullOrEmpty(pin.OrderId)) return;
+            TrackedOrder t = null;
+            lock (sync)
+            {
+                foreach (TrackedOrder item in tracked)
+                    if (item.Order != null && item.Order.OrderId == pin.OrderId)
+                    { t = item; break; }
+            }
+            if (t == null || t.Account == null) return;
+            Order[] live;
+            try { lock (t.Account.Orders) live = t.Account.Orders.ToArray(); }
+            catch { return; }
+            foreach (Order o in live)
+            {
+                if (o == null || string.IsNullOrEmpty(o.OrderId) || Order.IsTerminalState(o.OrderState)) continue;
+                bool stop = pin.StopOrderIds.Contains(o.OrderId);
+                bool target = pin.TargetOrderIds.Contains(o.OrderId);
+                if (!stop && !target) continue;
+                lock (sync)
+                {
+                    List<Order> stored = stop ? t.StopOrders : t.TargetOrders;
+                    if (!ContainsOrder(stored, o)) stored.Add(o);
+                }
+            }
+            try
+            {
+                AttachWorkingLegs(t, true);
+                AttachWorkingLegs(t, false);
+            }
+            catch { }
+        }
+
+        private void RestoreArms(List<OrderPin> arms)
+        {
+            if (arms == null) return;
+            foreach (OrderPin pin in arms)
+            {
+                lock (sync)
+                {
+                    bool exists = false;
+                    foreach (TrackedOrder t in tracked)
+                        if (t.Order == null && t.Label == pin.Label && (t.WaitMacd || t.WaitCross))
+                        { exists = true; break; }
+                    if (exists) continue;
+                    Account acct = FindAccount(pin.AccountName);
+                    TrackedOrder arm = TrackedFromPin(acct, null, pin);
+                    arm.WaitMacd = pin.WaitMacd;
+                    arm.WaitCross = pin.WaitCross;
+                    tracked.Add(arm);
+                    if (acct != null) HookAccount(acct);
+                }
+            }
+        }
+
+        private static Account FindAccount(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            lock (Account.All)
+            {
+                foreach (Account acct in Account.All)
+                    if (string.Equals(acct.Name, name, StringComparison.OrdinalIgnoreCase))
+                        return acct;
+            }
+            return null;
         }
 
         // Visible chart indicators with a usable plot. nameFilter limits the list to IndicatorNameFilter
@@ -1096,6 +2372,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     if (!kcList[i].IsEmaCross && ReferenceEquals(kcList[i].Indicator, keltnerIndicator))
                     { still = kcList[i]; break; }
             }
+            if (still == null && keltnerId.Valid)
+                still = FindSource(kcList, keltnerId);
             if (still == null)
             {
                 for (int i = 0; i < kcList.Count; i++)
@@ -1338,6 +2616,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
                 finally { suppressLineEvent = false; }
                 ApplyLineButtons("Cross");
+                CaptureChartIds();
+                SaveSelection();
                 return;
             }
             // MACD is the trigger. The Line list is the Keltner channel the order price follows.
@@ -1348,6 +2628,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             int mid = lineSrc == null ? -2 : lineSrc.MidPlot;
             int prefer = selectedPlot;
+            if (!resetToMidline && !string.IsNullOrEmpty(selectedLineName))
+            {
+                for (int i = 0; i < names.Count; i++)
+                {
+                    if (string.Equals(names[i], selectedLineName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        prefer = plots[i];
+                        break;
+                    }
+                }
+            }
             if (resetToMidline || prefer == int.MinValue || !plots.Contains(prefer))
             {
                 if (plots.Count == 0) prefer = int.MinValue;
@@ -1371,6 +2662,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             finally { suppressLineEvent = false; }
 
             ApplyLineButtons(selectedLineName);
+            CaptureChartIds();
+            SaveSelection();
         }
 
         // Named plots, plus a synthetic Midline when the first three plots have no mid name.
@@ -1403,6 +2696,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             selectedPlot = linePlots[idx];
             selectedLineName = lineCombo.SelectedItem as string ?? "Line";
             ApplyLineButtons(selectedLineName);
+            CaptureChartIds();
+            SaveSelection();
             lastMid = double.NaN;
             SetStatusNow("Tracking " + selectedLineName + ".");
             RereadAndTrack();
@@ -1584,7 +2879,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             qtyRow.Children.Add(qtyLabel); qtyRow.Children.Add(qtyElement);
             Place(qtyRow, 3, 0, 2);
 
-            // Row 4: ticks offset. The number is the zone width; MaxTicksOffset only trims a typed value above the ceiling.
+            // Row 4: signed tick offset. The number is the zone width, from -100.00 to 100.00.
             offsetRow = new System.Windows.Controls.Grid();
             offsetRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
             offsetRow.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -1600,17 +2895,20 @@ namespace NinjaTrader.NinjaScript.Indicators
             offsetPlusButton  = MakeSpinButton("+");
             offsetBox = new System.Windows.Controls.TextBox
             {
-                Text = "0", Height = 24, MinWidth = 0,
+                Text = "0.00", Height = 24, MinWidth = 0,
                 TextAlignment = TextAlignment.Center, VerticalContentAlignment = VerticalAlignment.Center,
                 Background = new SolidColorBrush(Color.FromRgb(0x2A, 0x2F, 0x38)),
                 Foreground = Brushes.White, CaretBrush = Brushes.White,
                 BorderBrush = new SolidColorBrush(Color.FromRgb(0x56, 0x5F, 0x6E)),
-                ToolTip = "Ticks from the selected line. Buys sit this many ticks above it; sells sit this many below. 0 uses the line. A typed value above Max ticks offset is trimmed to that ceiling."
+                ToolTip = "Signed ticks from the selected line, from -100.00 to 100.00. Positive puts buys above the line and sells below it. Negative flips that. 0.00 uses the line. Buttons, arrow keys, and the mouse wheel change it by 0.05. A magnitude above Max ticks offset is trimmed to that ceiling."
             };
             offsetBox.PreviewKeyDown   += OnOffsetKeyDown;
             offsetBox.PreviewTextInput += OnOffsetTextInput;
+            offsetBox.PreviewMouseLeftButtonDown += OnOffsetMouseDown;
+            offsetBox.GotKeyboardFocus += OnOffsetKeyboardFocus;
             offsetBox.MouseWheel       += OnOffsetWheel;
             offsetBox.LostFocus        += OnOffsetLostFocus;
+            DataObject.AddPastingHandler(offsetBox, OnOffsetPasting);
             offsetMinusButton.Click    += OnOffsetMinusClick;
             offsetPlusButton.Click     += OnOffsetPlusClick;
             System.Windows.Controls.Grid.SetColumn(offsetMinusButton, 0);
@@ -1857,8 +3155,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 offsetBox.PreviewKeyDown   -= OnOffsetKeyDown;
                 offsetBox.PreviewTextInput -= OnOffsetTextInput;
+                offsetBox.PreviewMouseLeftButtonDown -= OnOffsetMouseDown;
+                offsetBox.GotKeyboardFocus -= OnOffsetKeyboardFocus;
                 offsetBox.MouseWheel       -= OnOffsetWheel;
                 offsetBox.LostFocus        -= OnOffsetLostFocus;
+                DataObject.RemovePastingHandler(offsetBox, OnOffsetPasting);
             }
         }
 
@@ -2024,22 +3325,217 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void OnOffsetMinusClick(object sender, RoutedEventArgs e) { StepOffset(-1); }
         private void OnOffsetPlusClick(object sender, RoutedEventArgs e)  { StepOffset(+1); }
 
+        // The chart turns unhandled keys into its own windows. This box takes the key,
+        // edits the number here, and marks it handled so that window does not open.
         private void OnOffsetKeyDown(object sender, KeyEventArgs e)
         {
-            if (e.Key == Key.Up)        { StepOffset(+1); e.Handled = true; }
-            else if (e.Key == Key.Down) { StepOffset(-1); e.Handled = true; }
-            else if (e.Key == Key.Enter || e.Key == Key.Escape)
+            if (offsetBox == null) return;
+            if (e.Key == Key.Up)        { StepOffset(+1); e.Handled = true; return; }
+            if (e.Key == Key.Down)      { StepOffset(-1); e.Handled = true; return; }
+            if (e.Key == Key.Tab) return;
+            if (e.Key == Key.Enter || e.Key == Key.Escape)
             {
                 CommitOffset();
                 Keyboard.ClearFocus();
                 e.Handled = true;
+                return;
             }
+
+            ModifierKeys mods = Keyboard.Modifiers;
+            if ((mods & ModifierKeys.Control) == ModifierKeys.Control)
+            {
+                if (e.Key == Key.A) offsetBox.SelectAll();
+                else if (e.Key == Key.C) offsetBox.Copy();
+                else if (e.Key == Key.X) offsetBox.Cut();
+                else if (e.Key == Key.V) PasteOffset();
+                e.Handled = true;
+                return;
+            }
+            if ((mods & ModifierKeys.Alt) == ModifierKeys.Alt)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            if (e.Key == Key.Back)   { DeleteOffsetText(true);  e.Handled = true; return; }
+            if (e.Key == Key.Delete) { DeleteOffsetText(false); e.Handled = true; return; }
+            if (e.Key == Key.Left)   { MoveOffsetCaret(-1);     e.Handled = true; return; }
+            if (e.Key == Key.Right)  { MoveOffsetCaret(+1);     e.Handled = true; return; }
+            if (e.Key == Key.Home)   { PlaceOffsetCaret(0);     e.Handled = true; return; }
+            if (e.Key == Key.End)    { PlaceOffsetCaret((offsetBox.Text ?? "").Length); e.Handled = true; return; }
+
+            if ((mods & ModifierKeys.Shift) != ModifierKeys.Shift)
+            {
+                string ch = OffsetKeyChar(e.Key);
+                if (ch != null) InsertOffsetText(ch);
+            }
+            e.Handled = true;
+        }
+
+        // First click focuses and selects the current number so typing replaces it.
+        // The click is handled so it does not then drop the caret inside 0.00.
+        private void OnOffsetMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (offsetBox == null || offsetBox.IsKeyboardFocusWithin) return;
+            offsetBox.Focus();
+            e.Handled = true;
+        }
+
+        private void OnOffsetKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+        {
+            if (offsetBox != null) offsetBox.SelectAll();
         }
 
         private void OnOffsetTextInput(object sender, TextCompositionEventArgs e)
         {
-            foreach (char c in e.Text)
-                if (!char.IsDigit(c)) { e.Handled = true; return; }
+            if (offsetBox == null || !IsPartialOffset(ProposedOffsetText(offsetBox, e.Text)))
+                e.Handled = true;
+        }
+
+        private static string OffsetKeyChar(Key key)
+        {
+            if (key >= Key.D0 && key <= Key.D9) return ((char)('0' + (key - Key.D0))).ToString();
+            if (key >= Key.NumPad0 && key <= Key.NumPad9) return ((char)('0' + (key - Key.NumPad0))).ToString();
+            if (key == Key.OemMinus || key == Key.Subtract) return "-";
+            if (key == Key.OemPeriod || key == Key.Decimal) return ".";
+            if (key == Key.OemComma) return ",";
+            return null;
+        }
+
+        private void InsertOffsetText(string ch)
+        {
+            if (offsetBox == null || string.IsNullOrEmpty(ch)) return;
+            int start = offsetBox.SelectionStart;
+            string next = ProposedOffsetText(offsetBox, ch);
+            if (!IsPartialOffset(next)) return;
+            offsetBox.Text = next;
+            offsetBox.SelectionStart = Math.Min(next.Length, Math.Max(0, start) + ch.Length);
+            offsetBox.SelectionLength = 0;
+        }
+
+        private void DeleteOffsetText(bool backspace)
+        {
+            if (offsetBox == null) return;
+            string text = offsetBox.Text ?? "";
+            int start = offsetBox.SelectionStart;
+            int len = offsetBox.SelectionLength;
+            if (start < 0) start = 0;
+            if (start > text.Length) start = text.Length;
+            if (len < 0) len = 0;
+            if (start + len > text.Length) len = text.Length - start;
+
+            string next;
+            int caret;
+            if (len > 0)
+            {
+                next = text.Substring(0, start) + text.Substring(start + len);
+                caret = start;
+            }
+            else if (backspace)
+            {
+                if (start <= 0) return;
+                next = text.Substring(0, start - 1) + text.Substring(start);
+                caret = start - 1;
+            }
+            else
+            {
+                if (start >= text.Length) return;
+                next = text.Substring(0, start) + text.Substring(start + 1);
+                caret = start;
+            }
+            if (!IsPartialOffset(next)) return;
+            offsetBox.Text = next;
+            offsetBox.SelectionStart = caret;
+            offsetBox.SelectionLength = 0;
+        }
+
+        private void MoveOffsetCaret(int delta)
+        {
+            if (offsetBox == null) return;
+            int len = (offsetBox.Text ?? "").Length;
+            int pos = offsetBox.SelectionLength > 0
+                ? (delta < 0 ? offsetBox.SelectionStart : offsetBox.SelectionStart + offsetBox.SelectionLength)
+                : offsetBox.SelectionStart + delta;
+            PlaceOffsetCaret(pos < 0 ? 0 : (pos > len ? len : pos));
+        }
+
+        private void PlaceOffsetCaret(int pos)
+        {
+            if (offsetBox == null) return;
+            int len = (offsetBox.Text ?? "").Length;
+            if (pos < 0) pos = 0;
+            if (pos > len) pos = len;
+            offsetBox.SelectionStart = pos;
+            offsetBox.SelectionLength = 0;
+        }
+
+        private void PasteOffset()
+        {
+            if (offsetBox == null) return;
+            string insert;
+            try { insert = Clipboard.ContainsText() ? (Clipboard.GetText() ?? "") : ""; }
+            catch { return; }
+            int start = offsetBox.SelectionStart;
+            string next = ProposedOffsetText(offsetBox, insert);
+            if (!IsPartialOffset(next)) return;
+            offsetBox.Text = next;
+            offsetBox.SelectionStart = Math.Min(next.Length, Math.Max(0, start) + insert.Length);
+            offsetBox.SelectionLength = 0;
+        }
+
+        private void OnOffsetPasting(object sender, DataObjectPastingEventArgs e)
+        {
+            string insert = "";
+            if (e.DataObject != null && e.DataObject.GetDataPresent(DataFormats.UnicodeText))
+                insert = e.DataObject.GetData(DataFormats.UnicodeText) as string ?? "";
+            else if (e.DataObject != null && e.DataObject.GetDataPresent(DataFormats.Text))
+                insert = e.DataObject.GetData(DataFormats.Text) as string ?? "";
+            if (offsetBox == null || !IsPartialOffset(ProposedOffsetText(offsetBox, insert)))
+                e.CancelCommand();
+        }
+
+        private static string ProposedOffsetText(System.Windows.Controls.TextBox box, string insert)
+        {
+            string text = box.Text ?? "";
+            int start = box.SelectionStart;
+            int len = box.SelectionLength;
+            if (start < 0) start = 0;
+            if (start > text.Length) start = text.Length;
+            if (len < 0) len = 0;
+            if (start + len > text.Length) len = text.Length - start;
+            return text.Substring(0, start) + (insert ?? "") + text.Substring(start + len);
+        }
+
+        // Allows an in-progress entry such as "-", "-.", or "1.". Commit trims the value to [-100.00, 100.00].
+        private static bool IsPartialOffset(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return true;
+            string t = text.Trim();
+            if (t.Length == 0) return true;
+            if (t == "-" || t == "." || t == "," || t == "-." || t == "-,") return true;
+
+            string normalized = t.Replace(',', '.');
+            int dots = 0;
+            for (int i = 0; i < normalized.Length; i++)
+                if (normalized[i] == '.') dots++;
+            if (dots > 1) return false;
+            int dot = normalized.IndexOf('.');
+            if (dot >= 0 && normalized.Length - dot - 1 > 2) return false;
+            int intDigits = (dot >= 0 ? dot : normalized.Length) - (normalized[0] == '-' ? 1 : 0);
+            if (intDigits > 6) return false;
+            if (intDigits < 1 && dot < 0) return false;
+
+            double value;
+            return double.TryParse(normalized, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out value)
+                && !double.IsNaN(value) && !double.IsInfinity(value);
+        }
+
+        private static bool TryParseOffset(string text, out double value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string normalized = text.Trim().Replace(',', '.');
+            return double.TryParse(normalized, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out value);
         }
 
         private void OnOffsetWheel(object sender, MouseWheelEventArgs e)
@@ -2072,32 +3568,38 @@ namespace NinjaTrader.NinjaScript.Indicators
                 lineRow.Visibility = showTrack ? Visibility.Visible : Visibility.Collapsed;
         }
 
-        // Applies on Enter, focus loss, spin, or wheel. A value above the ceiling is trimmed; it does not widen the zone.
+        // Applies on Enter, focus loss, spin, or wheel. Values outside [-100.00, 100.00] are trimmed.
         private void CommitOffset()
         {
-            int parsed;
-            int n = 0;
-            if (offsetBox != null && int.TryParse(offsetBox.Text, out parsed))
+            double n = 0;
+            double parsed;
+            if (offsetBox != null && TryParseOffset(offsetBox.Text, out parsed))
                 n = parsed;
             ApplyOffset(n);
         }
 
-        private void StepOffset(int delta)
+        // direction is +1 or -1. Each click, arrow, or wheel notch moves 0.05 ticks.
+        private void StepOffset(int direction)
         {
-            int current = ticksOffset;
-            int parsed;
-            if (offsetBox != null && int.TryParse(offsetBox.Text, out parsed))
+            double current = CurrentOffset();
+            double parsed;
+            if (offsetBox != null && TryParseOffset(offsetBox.Text, out parsed))
                 current = parsed;
-            ApplyOffset(current + delta);
+            int cents = (int)Math.Round(current * 100.0, MidpointRounding.AwayFromZero);
+            int step = (int)Math.Round(OffsetStep * 100.0, MidpointRounding.AwayFromZero);
+            if (direction < 0) step = -step;
+            ApplyOffset((cents + step) / 100.0);
         }
 
-        private void ApplyOffset(int n)
+        private void ApplyOffset(double n)
         {
             n = ClampOffset(n);
-            bool changed = n != ticksOffset;
-            ticksOffset = n;
-            if (offsetBox != null && offsetBox.Text != n.ToString())
-                offsetBox.Text = n.ToString();
+            int cents = (int)Math.Round(n * 100.0, MidpointRounding.AwayFromZero);
+            bool changed = cents != ticksOffsetCents;
+            ticksOffsetCents = cents;
+            string shown = FormatOffset(n);
+            if (offsetBox != null && offsetBox.Text != shown)
+                offsetBox.Text = shown;
             if (changed && !double.IsNaN(lastMid))
                 TrackOrders(lastMid);
             if (changed && ChartControl != null)
@@ -2145,10 +3647,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (selectedKc != null && selectedKc.IsEmaCross)
                 return;
 
-            int n = ClampOffset(ticksOffset);
+            double n = CurrentOffset();
             double mid = lastMid;
             double tick = TickSize;
-            if (n <= 0 || double.IsNaN(mid) || mid <= 0 || tick <= 0)
+            if (n == 0 || double.IsNaN(mid) || mid <= 0 || tick <= 0)
                 return;
 
             double buyPrice  = Instrument.MasterInstrument.RoundToTickSize(mid + n * tick);
@@ -3690,10 +5192,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (sig == orderListSig)
             {
                 ChartControl.Dispatcher.InvokeAsync(UpdateLegButton);
+                SavePins();
                 return;
             }
             orderListSig = sig;
             ChartControl.Dispatcher.InvokeAsync(RefreshOrderList);
+            SavePins();
         }
 
         private void RefreshOrderList()
@@ -6353,8 +7857,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name = "Re-adopt working KC orders on reload", Order = 7, GroupName = "KC Mid Trader")]
         public bool AdoptExistingOrders { get; set; }
 
-        [Range(0, 100000)]
-        [Display(Name = "Max ticks offset", Description = "Ceiling for the Chart Trader Offset box only. A typed value above this is trimmed to this number. It is not the offset and it is not added to the midband.",
+        [Range(0, 100)]
+        [Display(Name = "Max ticks offset", Description = "Magnitude ceiling for the Chart Trader Offset box. The box accepts negative and positive values from -100.00 to 100.00, and a magnitude above this setting is trimmed to it. It is not the offset and it is not added to the line.",
                  Order = 8, GroupName = "KC Mid Trader")]
         public int MaxTicksOffset { get; set; }
     }
