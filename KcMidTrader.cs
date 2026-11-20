@@ -8,12 +8,12 @@
 //    * set a signed offset in ticks, from -100.00 to 100.00 (positive: buy above, sell below; negative flips that; 0 keeps the line)
 //    * show or hide that offset zone (light blue above, light red below)
 //    * BUY or SELL at the selected line plus that offset with one click (Midline by default)
-//    * keep those orders ATTACHED to the offset price (they follow the selected line as it moves)
-//    * on one checked filled order, point its stop or target at an indicator, remove either leg without closing the position, close the target on an EMA cross, or close the position when MACD falls through an absolute level
-//    * with two or more EMAs, track an EMA cross: Buy or Sell stays not filled until a later favorable cross, then the ATM stop is kept and the target waits for the next cross
-//    * MACD is a trigger, not a price. The Track window stores a magnitude. Buy waits for MACD to cross above it and Sell waits for MACD to cross below it. The order stays not filled until that cross, then a limit is sent at the Keltner midline and the selected ATM starts. On a filled order, SL / TP uses its own magnitude (default 0, a minus sign is ignored). At 0 a buy closes when MACD crosses down through 0 and a sell closes when MACD crosses up through 0. Any other magnitude closes either side when the absolute MACD level falls through it. A cross that is already true waits until MACD leaves the level and crosses again
+//    * keep those orders ATTACHED to the offset price. Each working order keeps its own line. The Track box sets that line at first. Changing Track or Line moves only the checked not-filled orders that have not had SL / TP applied; the others stay on the line they already follow
+//    * on one checked order, filled or still working, point its stop or target at an indicator, remove either leg without closing the position, close the target on an EMA cross, or close the position when MACD falls through an absolute level. A working order gets that stop and target immediately. They follow its price until it fills, then stay on the fill. Confirming SL / TP locks that bracket. It stays there, including when Track is an EMA or any study other than the Keltner, until SL / TP is confirmed again. Each order keeps its own choice. A not-filled order changes that choice only when it is checked. One checked order is changed by itself. Two or more checked not-filled orders take the same line or value when they are set together from the Chart Trader ATM strategy or the SL / TP window
+//    * with two or more EMAs, track an EMA cross: Buy or Sell stays not filled until a later favorable cross, then the ATM stop is kept and the target waits for the next cross. EMA A starts on EMA(9) and EMA B on EMA(20) when those EMAs are on the chart. When a Keltner Channel is on the chart, EMA A or EMA B can be that Keltner, on Midline (the default), Upper, or Lower
+//    * MACD is a trigger, not a price. The Track window stores a magnitude. Buy waits for MACD to cross above it and Sell waits for MACD to cross below it. The order stays not filled until that cross, then a limit is sent at the Keltner midline and the selected ATM starts. SL / TP on a filled or working order uses its own magnitude (default 0, a minus sign is ignored). At 0 a buy closes when MACD crosses down through 0 and a sell closes when MACD crosses up through 0. Any other magnitude closes either side when the absolute MACD level falls through it. A cross that is already true waits until MACD leaves the level and crosses again. A working order keeps the choice and uses it once it fills
 //    * CANCEL every order this tool placed with one click
-//    * Chart Trader Buy/Sell Mkt, Bid, and Ask orders are listed too. The selected ATM keeps its stop and target, and one checked filled order uses SL / TP
+//    * Chart Trader Buy Mkt, Sell Mkt, Buy Bid, Buy Ask, Sell Bid, and Sell Ask are listed too. Each one moves through Not filled, Filled, and Completed. The selected ATM keeps its stop and target. One checked order, filled or not filled, uses SL / TP by itself. Checked not-filled orders that are set together share that stop and target
 //
 //  The section is only shown while a (visible) stock Keltner Channel is on the chart.
 //  The midband is recomputed internally with the SAME Period / Offset multiplier as the
@@ -116,7 +116,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             public double       ReplacePrice;
             public bool         Paused;           // tracking paused because price crossed market (Block mode)
             public bool         EntryFilled;      // at least one fill; stop/target may now exist
-            public bool         SelectedForAtm;   // user opted this filled order into ATM changes
+            public bool         SelectedForAtm;   // user checked this order for SL / TP or ATM changes
+            public bool         BracketSet;       // SL / TP was confirmed for this order, filled or not
+            public double       BracketAnchor;    // entry price last used to place the ATM legs
             public double       FillPrice;
             public NinjaTrader.NinjaScript.StrategyBase AtmOwner;
             public readonly List<Order> StopOrders = new List<Order>();
@@ -135,6 +137,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             public readonly List<HeldLeg> Relink = new List<HeldLeg>();
             public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase TargetEmaA;
             public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase TargetEmaB;
+            public int          TargetEmaAPlot;   // 0 for an EMA; Keltner Midline, Upper, or Lower
+            public int          TargetEmaBPlot;
             public int          TargetEmaSign;
             public bool         TargetCrossSent;
             public bool         TargetCrossPending;
@@ -164,12 +168,17 @@ namespace NinjaTrader.NinjaScript.Indicators
             public bool         ArmNoted;
             public bool         QuickEntry;       // Chart Trader Buy/Sell Mkt, Bid, or Ask; not a midline order
             public bool         QuickBracketsPlaced;
+            public DateTime     AtmGraceUntil;    // after a fill, the ATM gets a moment to submit its own stop / target
             public IndId       StopId;
             public IndId       TargetId;
             public IndId       EmaAId;
             public IndId       EmaBId;
             public IndId       EntryMacdId;
             public IndId       EntryPriceId;
+            public int          LinePlot = int.MinValue; // Keltner plot this working order follows
+            public bool         LinePlotSet;
+            public NinjaTrader.Gui.NinjaScript.IndicatorRenderBase LineInd; // Track indicator this working order follows
+            public IndId       LineId;
         }
 
         private enum QuickMode
@@ -230,6 +239,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             public System.Windows.Controls.ComboBox BandBox;
             public System.Windows.Controls.ComboBox EmaABox;
             public System.Windows.Controls.ComboBox EmaBBox;
+            public System.Windows.Controls.ComboBox EmaABand;
+            public System.Windows.Controls.ComboBox EmaBBand;
             public System.Windows.Controls.Panel EmaPanel;
             public System.Windows.Controls.Button MacdButton;
             public double MacdLevel;
@@ -290,6 +301,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             public IndId TargetId;
             public IndId EmaAId;
             public IndId EmaBId;
+            public int EmaAPlot;
+            public int EmaBPlot;
             public IndId EntryMacdId;
             public IndId EntryPriceId;
             public int StopPlot;
@@ -299,11 +312,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             public double StopMacdLevel;
             public double TargetMacdLevel;
             public int TargetEmaSign;
+            public bool BracketSet;
             public double Price;
             public string OrderName;
             public long OrderTicks;
             public readonly List<string> StopOrderIds = new List<string>();
             public readonly List<string> TargetOrderIds = new List<string>();
+            public int LinePlot = int.MinValue;
+            public bool LinePlotSet;
+            public IndId LineId;
         }
 
         private sealed class ChartSession
@@ -314,6 +331,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             public IndId Keltner;
             public IndId EmaA;
             public IndId EmaB;
+            public int EmaAPlot;
+            public int EmaBPlot;
             public string EmaAName;
             public string EmaBName;
             public string LineName;
@@ -380,8 +399,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         private NinjaTrader.Gui.NinjaScript.IndicatorRenderBase keltnerIndicator;
         private volatile NinjaTrader.Gui.NinjaScript.IndicatorRenderBase crossEmaA;
         private volatile NinjaTrader.Gui.NinjaScript.IndicatorRenderBase crossEmaB;
+        private volatile int  crossEmaAPlot;
+        private volatile int  crossEmaBPlot;
         private volatile bool crossConfigured;
-        private volatile int  emaOnChart;
+        private volatile int  crossChoices;
+        private volatile bool crossPairOnChart;
         // Not volatile: C# rejects volatile double (CS0677). Published by the volatile
         // macdConfigured write below, which readers check before using this value.
         private double macdLevel = double.NaN;
@@ -523,7 +545,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     EnsureAdopted();
                     DetectKeltner();
                     if (atmSelector == null) HookAtmSelector();
-                    if (quickButtons.Count == 0) HookQuickButtons();
+                    if (quickButtons.Count < 6) HookQuickButtons();
+                    else HookChartAccount();
                 });
 
             // EMA cross and MACD levels use the closed bar only, even in OnPriceChange mode.
@@ -728,7 +751,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         // Returns a message for the status line. label null creates a new Ord- id.
         private string Submit(Account acct, OrderAction action, int qty, double price,
                               NinjaTrader.NinjaScript.AtmStrategy atm, bool track, string label, bool followAtm, string atmName,
-                              bool followThrough = false)
+                              bool followThrough = false, TrackedOrder carry = null)
         {
             bool   isBuy = action == OrderAction.Buy;
             double refPx = RefPrice(isBuy);
@@ -801,6 +824,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 bool selected;
                 if (checkedLabels.TryGetValue(label, out selected))
                     t.SelectedForAtm = selected;
+                StampLine(t, carry);
+                CopyBracketPlan(carry, t);
                 tracked.Add(t);
             }
 
@@ -811,6 +836,36 @@ namespace NinjaTrader.NinjaScript.Indicators
                 type.Value == OrderType.Limit ? "LMT" : "STP",
                 Instrument.MasterInstrument.FormatPrice(price),
                 track ? " (tracking)" : "");
+        }
+
+        // A replaced working order keeps the SL / TP the user confirmed. The new ATM builds its own
+        // orders; legs that are not left on the ATM are applied again as those orders appear.
+        private static void CopyBracketPlan(TrackedOrder from, TrackedOrder to)
+        {
+            if (from == null || to == null || !from.BracketSet) return;
+            to.BracketSet = true;
+            to.BracketAnchor = 0;
+            to.StopSource = from.StopSource;
+            to.StopIndicator = from.StopIndicator;
+            to.StopPlot = from.StopPlot;
+            to.StopMacdSet = from.StopMacdSet;
+            to.StopMacdLevel = from.StopMacdLevel;
+            to.StopMacdSign = from.StopMacdSign;
+            to.StopId = from.StopId;
+            to.TargetSource = from.TargetSource;
+            to.TargetIndicator = from.TargetIndicator;
+            to.TargetPlot = from.TargetPlot;
+            to.TargetEmaA = from.TargetEmaA;
+            to.TargetEmaB = from.TargetEmaB;
+            to.TargetEmaAPlot = from.TargetEmaAPlot;
+            to.TargetEmaBPlot = from.TargetEmaBPlot;
+            to.TargetEmaSign = from.TargetEmaSign;
+            to.TargetMacdSet = from.TargetMacdSet;
+            to.TargetMacdLevel = from.TargetMacdLevel;
+            to.TargetMacdSign = from.TargetMacdSign;
+            to.TargetId = from.TargetId;
+            to.EmaAId = from.EmaAId;
+            to.EmaBId = from.EmaBId;
         }
 
         private static bool IsChangeable(Order o)
@@ -826,6 +881,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             try
             {
             List<TrackedOrder> toResubmit = new List<TrackedOrder>();
+            List<TrackedOrder> dropLegs = new List<TrackedOrder>();
             string msg = null;
 
             lock (sync)
@@ -847,6 +903,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         if (st == OrderState.Cancelled && t.Order.Filled <= 0)
                         {
                             toResubmit.Add(t);
+                            dropLegs.Add(t);
                             tracked.RemoveAt(i);
                         }
                         else if (st == OrderState.Filled || (st == OrderState.Cancelled && t.Order.Filled > 0))
@@ -858,6 +915,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         }
                         else if (st == OrderState.Rejected)
                         {
+                            dropLegs.Add(t);
                             tracked.RemoveAt(i);
                             msg = (t.Label ?? "Order") + " rejected before replace - nothing re-submitted.";
                         }
@@ -869,16 +927,24 @@ namespace NinjaTrader.NinjaScript.Indicators
                         if (st == OrderState.Rejected)
                         {
                             msg = (t.Label ?? "Order") + " rejected - see the Log tab.";
+                            dropLegs.Add(t);
                             tracked.RemoveAt(i);
                             continue;
                         }
                         // A fill stays on the list as F (or NF while a partial is still open).
-                        // Only a cancel that never filled is dropped.
+                        // Only a cancel that never filled is dropped. Brackets placed while it
+                        // was working are cancelled with it.
                         if (t.Order.Filled <= 0)
+                        {
+                            dropLegs.Add(t);
                             tracked.RemoveAt(i);
+                        }
                     }
                 }
             }
+
+            foreach (TrackedOrder t in dropLegs)
+                CancelTrackedLegs(t);
 
             foreach (TrackedOrder t in toResubmit)
             {
@@ -886,7 +952,14 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (remaining <= 0) continue;
                 NinjaTrader.NinjaScript.AtmStrategy atm = t.SwapAtm ? t.ReplaceAtm : t.AtmTemplate;
                 string atmName = t.SwapAtm ? (t.ReplaceAtmName ?? "") : (t.AtmName ?? "");
-                msg = "Replaced: " + Submit(t.Account, t.Action, remaining, t.ReplacePrice, atm, t.Track, t.Label, t.FollowAtm, atmName, t.FollowThrough);
+                // A Chart Trader ATM change replaces the previous stop and target on this order.
+                bool followAtm = t.FollowAtm;
+                if (t.SwapAtm)
+                {
+                    t.BracketSet = false;
+                    followAtm = atmName.Length > 0;
+                }
+                msg = "Replaced: " + Submit(t.Account, t.Action, remaining, t.ReplacePrice, atm, t.Track, t.Label, followAtm, atmName, t.FollowThrough, t);
             }
 
             if (msg != null) SetStatus(msg);
@@ -900,18 +973,35 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void TrackOrders(double mid)
         {
-            if (double.IsNaN(mid)) return;
+            int bar = CurrentBar;
+            if (TrackMode == NinjaTrader.NinjaScript.KcMidTraderTypes.KcTrackMode.OnBarClose && IsFirstTickOfBar)
+                bar = CurrentBar - 1;
+            if (bar < 0) bar = CurrentBar;
 
             List<TrackedOrder> snapshot;
             lock (sync) snapshot = tracked.Where(x => x.Track && !x.PendingReplace).ToList();
+            if (snapshot.Count == 0) return;
 
             foreach (TrackedOrder t in snapshot)
             {
                 Order o = t.Order;
                 if (o == null || t.QuickEntry || t.WaitCross || t.WaitMacd || !IsChangeable(o)) continue;
 
+                double line = mid;
+                // An order that already has its own line, or a bracket confirmed in SL / TP, must not
+                // fall back onto the Track box. That fallback was pulling EMA orders onto the Keltner midline.
+                if (t.LinePlotSet || t.BracketSet)
+                {
+                    double raw;
+                    if (!t.LinePlotSet || t.LineInd == null || bar < 0
+                        || !TryReadSeries(t.LineInd, t.LinePlot, bar, out raw))
+                        continue;
+                    line = Instrument.MasterInstrument.RoundToTickSize(raw);
+                }
+                if (double.IsNaN(line)) continue;
+
                 bool   isBuy   = t.Action == OrderAction.Buy;
-                double target  = OffsetPrice(isBuy, mid);
+                double target  = OffsetPrice(isBuy, line);
                 double current = o.OrderType == OrderType.Limit ? o.LimitPrice : o.StopPrice;
                 OrderType? want = DesiredType(isBuy, target, RefPrice(isBuy));
 
@@ -1249,6 +1339,27 @@ namespace NinjaTrader.NinjaScript.Indicators
         // =================================================================================
         //  Keltner detection (UI thread)
         // =================================================================================
+        // Counts EMAs and Keltner channels that can be EMA A or EMA B, and drops a cross whose line left the chart.
+        private void RefreshCrossPair(List<KcSource> all)
+        {
+            int choices = 0;
+            bool sawA = false, sawB = false;
+            if (all != null)
+            {
+                foreach (KcSource k in all)
+                {
+                    if (k == null || k.IsEmaCross || k.Indicator == null || !IsCrossChoice(k)) continue;
+                    choices++;
+                    if (ReferenceEquals(k.Indicator, crossEmaA)) sawA = true;
+                    if (ReferenceEquals(k.Indicator, crossEmaB)) sawB = true;
+                }
+            }
+            crossChoices = choices;
+            crossPairOnChart = sawA && sawB && !ReferenceEquals(crossEmaA, crossEmaB);
+            if (crossConfigured && !crossPairOnChart)
+                crossConfigured = false;
+        }
+
         private void DetectKeltner()
         {
             EnsureLoaded();
@@ -1269,22 +1380,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             // Track stays on the name filter unless Toggle track is on. The current choice stays listed after lock.
             List<KcSource> found = CollectSources(!trackPickerOn, onChart);
             List<KcSource> all = trackPickerOn ? found : CollectSources(false, null);
-            int emas = 0;
-            bool pairAlive = false;
-            bool sawA = false, sawB = false;
-            foreach (KcSource k in all)
-            {
-                if (!IsEma(k) || k.Indicator == null) continue;
-                emas++;
-                if (ReferenceEquals(k.Indicator, crossEmaA)) sawA = true;
-                if (ReferenceEquals(k.Indicator, crossEmaB)) sawB = true;
-            }
-            pairAlive = crossConfigured && sawA && sawB && !ReferenceEquals(crossEmaA, crossEmaB);
-            emaOnChart = emas;
-            if (!pairAlive)
-                crossConfigured = false;
-            // EMA cross is a Track row, not a chart study. It needs two EMAs and a real indicator so the panel stays up.
-            if (emas >= 2 && found.Count > 0)
+            RefreshCrossPair(all);
+            // EMA cross is a Track row, not a chart study. It needs two lines and a real indicator so the panel stays up.
+            if (crossChoices >= 2 && found.Count > 0)
             {
                 KcSource cross = new KcSource();
                 cross.IsEmaCross = true;
@@ -1321,6 +1419,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                     keep = kcList.FirstOrDefault(x => x.IsEmaCross);
                 else if (prev != null)
                     keep = kcList.FirstOrDefault(x => !x.IsEmaCross && ReferenceEquals(x.Indicator, prev.Indicator));
+                if (keep == null && prev != null && !wasCross && prev.Indicator != null && IsOnChart(prev.Indicator))
+                {
+                    if (SameSource(kcList, prev) == null)
+                        kcList.Add(prev);
+                    keep = prev;
+                }
 
                 // Apply/OK on the Indicators window replaces every indicator object. Match the
                 // saved type and chart slot so Track and Line stay on the line the orders used.
@@ -1344,6 +1448,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     return;
                 }
 
+                // keep == null means the previous study is gone. Only then may the line reset.
+                bool resetLine = keep == null;
                 selectedKc = keep ?? (kcList.Count > 0 ? kcList[0] : null);
                 if ((wasCross || fromMemory && memory != null && memory.EmaCross)
                     && (selectedKc == null || !selectedKc.IsEmaCross))
@@ -1354,7 +1460,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 RefreshCombo();
                 if (fromMemory)
                     ApplyMemoryLine(memory);
-                RefreshLineCombo(keep == null);
+                RefreshLineCombo(resetLine);
                 if (fromMemory && !restoredNoted)
                 {
                     restoredNoted = true;
@@ -1367,6 +1473,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (memory != null && memory.HasTrack
                 && ((memory.EmaCross && !crossConfigured) || (memory.MacdOn && !macdConfigured) || (memory.Keltner.Valid && keltnerIndicator == null)))
                 RestoreMemorySettings(memory, all);
+            RefreshCrossPair(all);
             RememberKeltner();
 
             // Help in the NinjaScript Output window when nothing matches.
@@ -1499,6 +1606,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 sb.Append("EA=").AppendLine(IdText(s.EmaA));
                 sb.Append("EB=").AppendLine(IdText(s.EmaB));
                 sb.Append("EN=").Append(s.EmaAName ?? "").Append('\x1f').AppendLine(s.EmaBName ?? "");
+                sb.Append("EP=").Append(s.EmaAPlot.ToString(CultureInfo.InvariantCulture)).Append('\x1f')
+                    .AppendLine(s.EmaBPlot.ToString(CultureInfo.InvariantCulture));
                 sb.Append("L=").AppendLine(s.LineName ?? "");
                 sb.Append("P=").AppendLine(s.Plot.ToString(CultureInfo.InvariantCulture));
                 sb.Append("MD=").Append(s.MacdOn ? "1" : "0").Append('\x1f')
@@ -1547,6 +1656,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                     string[] names = value.Split('\x1f');
                     current.EmaAName = names.Length > 0 ? names[0] : "";
                     current.EmaBName = names.Length > 1 ? names[1] : "";
+                }
+                else if (name == "EP")
+                {
+                    string[] plots = value.Split('\x1f');
+                    int plot;
+                    if (plots.Length > 0 && int.TryParse(plots[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out plot))
+                        current.EmaAPlot = plot;
+                    if (plots.Length > 1 && int.TryParse(plots[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out plot))
+                        current.EmaBPlot = plot;
                 }
                 else if (name == "L") current.LineName = value;
                 else if (name == "P")
@@ -1607,7 +1725,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private static string PinText(OrderPin pin)
         {
-            string[] f = new string[40];
+            string[] f = new string[46];
             f[0] = pin.OrderId ?? "";
             f[1] = pin.AccountName ?? "";
             f[2] = pin.Label ?? "";
@@ -1648,6 +1766,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             f[37] = pin.OrderTicks.ToString(CultureInfo.InvariantCulture);
             f[38] = string.Join(",", pin.StopOrderIds.ToArray());
             f[39] = string.Join(",", pin.TargetOrderIds.ToArray());
+            f[40] = pin.BracketSet ? "1" : "0";
+            f[41] = pin.EmaAPlot.ToString(CultureInfo.InvariantCulture);
+            f[42] = pin.EmaBPlot.ToString(CultureInfo.InvariantCulture);
+            f[43] = pin.LinePlotSet ? "1" : "0";
+            f[44] = pin.LinePlot.ToString(CultureInfo.InvariantCulture);
+            f[45] = IdText(pin.LineId);
             return string.Join("\x1e", f);
         }
 
@@ -1707,6 +1831,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 pin.OrderTicks = ticks;
             if (f.Length > 38) SplitIds(f[38], pin.StopOrderIds);
             if (f.Length > 39) SplitIds(f[39], pin.TargetOrderIds);
+            if (f.Length > 40) pin.BracketSet = f[40] == "1";
+            if (f.Length > 41 && int.TryParse(f[41], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.EmaAPlot = n;
+            if (f.Length > 42 && int.TryParse(f[42], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.EmaBPlot = n;
+            if (f.Length > 43) pin.LinePlotSet = f[43] == "1";
+            if (f.Length > 44 && int.TryParse(f[44], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) pin.LinePlot = n;
+            if (f.Length > 45) pin.LineId = ParseId(f[45]);
             return pin;
         }
 
@@ -1730,7 +1860,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool SavedIndicatorStillPresent(ChartSession memory)
         {
             if (memory == null || ChartControl == null || ChartControl.Indicators == null) return false;
-            if (memory.EmaCross) return emaOnChart >= 2;
+            if (memory.EmaCross) return crossChoices >= 2;
             if (!memory.Track.Valid || string.IsNullOrEmpty(memory.Track.TypeName)) return false;
             try
             {
@@ -1877,6 +2007,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     crossEmaA = a.Indicator;
                     crossEmaB = b.Indicator;
+                    crossEmaAPlot = memory.EmaAPlot;
+                    crossEmaBPlot = memory.EmaBPlot;
                     emaAId = memory.EmaA;
                     emaBId = memory.EmaB;
                     crossEmaAName = string.IsNullOrEmpty(memory.EmaAName) ? SafeDisplayName(a.Indicator) : memory.EmaAName;
@@ -1911,6 +2043,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     t.EmaBId = IdOf(t.TargetEmaB, t.EmaBId);
                     t.EntryMacdId = IdOf(t.EntryMacd, t.EntryMacdId);
                     t.EntryPriceId = IdOf(t.EntryPriceInd, t.EntryPriceId);
+                    t.LineId = IdOf(t.LineInd, t.LineId);
                 }
             }
         }
@@ -1932,6 +2065,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 s.Keltner = keltnerId;
                 s.EmaA = emaAId;
                 s.EmaB = emaBId;
+                s.EmaAPlot = crossEmaAPlot;
+                s.EmaBPlot = crossEmaBPlot;
                 s.EmaAName = crossEmaAName;
                 s.EmaBName = crossEmaBName;
                 s.LineName = selectedLineName;
@@ -1983,8 +2118,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                     pin.TargetId = t.TargetId;
                     pin.EmaAId = t.EmaAId;
                     pin.EmaBId = t.EmaBId;
+                    pin.EmaAPlot = t.TargetEmaAPlot;
+                    pin.EmaBPlot = t.TargetEmaBPlot;
                     pin.EntryMacdId = t.EntryMacdId;
                     pin.EntryPriceId = t.EntryPriceId;
+                    pin.LinePlot = t.LinePlot;
+                    pin.LinePlotSet = t.LinePlotSet;
+                    pin.LineId = t.LineId;
                     pin.StopPlot = t.StopPlot;
                     pin.TargetPlot = t.TargetPlot;
                     pin.StopMacdSet = t.StopMacdSet;
@@ -1992,6 +2132,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     pin.StopMacdLevel = t.StopMacdLevel;
                     pin.TargetMacdLevel = t.TargetMacdLevel;
                     pin.TargetEmaSign = t.TargetEmaSign;
+                    pin.BracketSet = t.BracketSet;
                     pin.Price = OrderPrice(t.Order);
                     pin.OrderName = t.Order == null ? "" : (t.Order.Name ?? "");
                     try { pin.OrderTicks = t.Order == null ? 0 : t.Order.Time.Ticks; }
@@ -2020,44 +2161,51 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
+        // The indicator the order is using wins while it is still on the chart. A saved id is only
+        // a way to find the replacement after the Indicators window rebuilds the objects. Using the
+        // saved id first put the Keltner back over an EMA the SL / TP window had just chosen.
+        private NinjaTrader.Gui.NinjaScript.IndicatorRenderBase HoldIndicator(
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase current, ref IndId id, List<KcSource> all)
+        {
+            if (current != null && IsOnChart(current))
+            {
+                id = IdOf(current, id);
+                return current;
+            }
+            KcSource src = FindSource(all, id);
+            if (src == null || src.Indicator == null) return current;
+            id = IdOf(src.Indicator, id);
+            return src.Indicator;
+        }
+
         private void RebindTrackedIndicators(List<KcSource> all)
         {
             lock (sync)
             {
                 foreach (TrackedOrder t in tracked)
                 {
-                    KcSource src;
                     if (t.StopSource == LegFollow.Indicator || t.StopSource == LegFollow.Macd)
-                    {
-                        src = FindSource(all, t.StopId);
-                        if (src != null) t.StopIndicator = src.Indicator;
-                    }
+                        t.StopIndicator = HoldIndicator(t.StopIndicator, ref t.StopId, all);
                     if (t.TargetSource == LegFollow.Indicator || t.TargetSource == LegFollow.Macd)
-                    {
-                        src = FindSource(all, t.TargetId);
-                        if (src != null) t.TargetIndicator = src.Indicator;
-                    }
+                        t.TargetIndicator = HoldIndicator(t.TargetIndicator, ref t.TargetId, all);
                     if (t.TargetSource == LegFollow.EmaCross)
                     {
-                        src = FindSource(all, t.EmaAId);
-                        if (src != null) t.TargetEmaA = src.Indicator;
-                        src = FindSource(all, t.EmaBId);
-                        if (src != null) t.TargetEmaB = src.Indicator;
+                        t.TargetEmaA = HoldIndicator(t.TargetEmaA, ref t.EmaAId, all);
+                        t.TargetEmaB = HoldIndicator(t.TargetEmaB, ref t.EmaBId, all);
                     }
                     if (t.WaitMacd || t.EntryMacdId.Valid)
+                        t.EntryMacd = HoldIndicator(t.EntryMacd, ref t.EntryMacdId, all);
+                    if (t.EntryPriceInd != null || t.EntryPriceId.Valid)
                     {
-                        src = FindSource(all, t.EntryMacdId);
-                        if (src != null) t.EntryMacd = src.Indicator;
-                    }
-                    if (t.EntryPriceId.Valid)
-                    {
-                        src = FindSource(all, t.EntryPriceId);
-                        if (src != null)
+                        t.EntryPriceInd = HoldIndicator(t.EntryPriceInd, ref t.EntryPriceId, all);
+                        if (t.EntryPriceInd != null && t.EntryPricePlot == int.MinValue)
                         {
-                            t.EntryPriceInd = src.Indicator;
-                            if (t.EntryPricePlot == int.MinValue) t.EntryPricePlot = src.MidPlot;
+                            KcSource src = FindSource(all, t.EntryPriceId);
+                            if (src != null) t.EntryPricePlot = src.MidPlot;
                         }
                     }
+                    if (t.LineInd != null || t.LineId.Valid)
+                        t.LineInd = HoldIndicator(t.LineInd, ref t.LineId, all);
                 }
             }
         }
@@ -2150,8 +2298,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             t.TargetId = pin.TargetId;
             t.EmaAId = pin.EmaAId;
             t.EmaBId = pin.EmaBId;
+            t.TargetEmaAPlot = pin.EmaAPlot;
+            t.TargetEmaBPlot = pin.EmaBPlot;
             t.EntryMacdId = pin.EntryMacdId;
             t.EntryPriceId = pin.EntryPriceId;
+            t.LinePlot = pin.LinePlot;
+            t.LinePlotSet = pin.LinePlotSet;
+            t.LineId = pin.LineId;
             t.StopPlot = pin.StopPlot;
             t.TargetPlot = pin.TargetPlot;
             t.StopMacdSet = pin.StopMacdSet;
@@ -2159,6 +2312,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             t.StopMacdLevel = pin.StopMacdLevel;
             t.TargetMacdLevel = pin.TargetMacdLevel;
             t.TargetEmaSign = pin.TargetEmaSign;
+            t.BracketSet = pin.BracketSet;
             if (pin.Quantity > 0) t.Quantity = pin.Quantity;
             t.Action = pin.Action;
             bool selected;
@@ -2432,6 +2586,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
             }
             pendingTrackMacd = null;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase previousInd = PriceIndicator();
+            int previousPlot = ConcretePlot(selectedPlot);
             if (pick.IsEmaCross)
             {
                 KcSource previous = selectedKc;
@@ -2444,7 +2600,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (crossIdx < 0)
                 {
                     RestoreTrackSelection(previous);
-                    SetStatusNow("EMA cross needs two EMAs.");
+                    SetStatusNow("EMA cross needs two EMAs, or an EMA and a Keltner.");
                     return;
                 }
                 suppressComboEvent = true;
@@ -2454,6 +2610,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 kcFound = true;
                 lastMid = double.NaN;
                 RefreshLineCombo(true);
+                AssignLineToTargets(previousInd, previousPlot);
                 SetStatusNow("Tracking EMA cross. Buy when " + crossEmaAName + " crosses above " + crossEmaBName
                     + ". Sell when " + crossEmaAName + " crosses below " + crossEmaBName + ".");
                 if (ChartControl != null) ChartControl.InvalidateVisual();
@@ -2464,7 +2621,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             RememberKeltner();
             lastMid    = double.NaN;   // readout refreshes on the next tick with the new line
             RefreshLineCombo(true);
-            SetStatusNow("Tracking " + pick.Label + ". Line reset to " + selectedLineName + ".");
+            int moved = AssignLineToTargets(previousInd, previousPlot);
+            SetStatusNow("Tracking " + pick.Label + ". Line reset to " + selectedLineName + "." + MovedText(moved));
             RereadAndTrack();
         }
 
@@ -2518,6 +2676,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             suppressComboEvent = true;
             try { if (kcCombo != null) kcCombo.SelectedIndex = idx; }
             finally { suppressComboEvent = false; }
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase previousInd = PriceIndicator();
+            int previousPlot = ConcretePlot(selectedPlot);
             macdLevel = level;
             macdConfigured = true;
             selectedKc = kcList[idx];
@@ -2525,8 +2685,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             lastMid = double.NaN;
             shownMacdText = null;
             RefreshLineCombo(true);
+            int moved = AssignLineToTargets(previousInd, previousPlot);
             SetStatusNow("Tracking the Keltner " + selectedLineName + ". MACD magnitude is " + FormatMacd(level)
-                + ". Buy waits for a cross above it. Sell waits for a cross below it.");
+                + ". Buy waits for a cross above it. Sell waits for a cross below it." + MovedText(moved));
+            RereadAndTrack();
             UpdateReadout();
             if (ChartControl != null) ChartControl.InvalidateVisual();
         }
@@ -2693,14 +2855,113 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (suppressLineEvent || lineCombo == null) return;
             int idx = lineCombo.SelectedIndex;
             if (idx < 0 || idx >= linePlots.Count) return;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase previousInd = PriceIndicator();
+            int previousPlot = ConcretePlot(selectedPlot);
             selectedPlot = linePlots[idx];
             selectedLineName = lineCombo.SelectedItem as string ?? "Line";
             ApplyLineButtons(selectedLineName);
             CaptureChartIds();
             SaveSelection();
+            int moved = AssignLineToTargets(previousInd, previousPlot);
             lastMid = double.NaN;
-            SetStatusNow("Tracking " + selectedLineName + ".");
+            SetStatusNow("Tracking " + selectedLineName + "." + MovedText(moved));
             RereadAndTrack();
+        }
+
+        // The plot a new order, or an order that has not been given its own line yet, is following.
+        private int ConcretePlot(int plot)
+        {
+            if (plot != int.MinValue) return plot;
+            KcSource src = PriceSource();
+            if (src == null) return int.MinValue;
+            return ActivePlot(src);
+        }
+
+        // A working not-filled order that follows a Keltner line. Filled orders and Chart Trader clicks stay put.
+        private static bool FollowsLine(TrackedOrder t)
+        {
+            if (t == null || t.Completed || t.QuickEntry || t.WaitCross || !t.Track) return false;
+            if (t.WaitMacd && t.Order == null) return true;
+            if (t.Order == null) return false;
+            return IsChangeable(t.Order);
+        }
+
+        // Checked working orders that have not had SL / TP confirmed take the new Track and Line.
+        // With none of those checked, only the newest such order does. A confirmed bracket keeps
+        // its line until SL / TP is confirmed again.
+        private int AssignLineToTargets(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase previousInd, int previousPlot)
+        {
+            KcSource src = PriceSource();
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind = src == null ? null : src.Indicator;
+            int plot = ConcretePlot(selectedPlot);
+            int moved = 0;
+            lock (sync)
+            {
+                List<TrackedOrder> lines = tracked.Where(x => FollowsLine(x) && !x.BracketSet).ToList();
+                List<TrackedOrder> picks = lines.Where(x => x.SelectedForAtm).ToList();
+                if (picks.Count == 0 && lines.Count > 0) picks.Add(lines[lines.Count - 1]);
+                if (ind == null || plot == int.MinValue) picks.Clear();
+                foreach (TrackedOrder t in lines)
+                {
+                    if (picks.Contains(t))
+                    {
+                        t.LineInd = ind;
+                        t.LineId = IdOf(ind, t.LineId);
+                        t.LinePlot = plot;
+                        t.LinePlotSet = true;
+                        t.EntryPricePlot = plot;
+                        if (t.WaitMacd) t.EntryPriceInd = ind;
+                        moved++;
+                        continue;
+                    }
+                    if (!t.LinePlotSet)
+                    {
+                        t.LinePlot = previousPlot;
+                        t.LinePlotSet = previousPlot != int.MinValue;
+                        if (t.WaitMacd) t.EntryPricePlot = previousPlot;
+                    }
+                    if (t.LineInd == null && previousInd != null)
+                    {
+                        t.LineInd = previousInd;
+                        t.LineId = IdOf(previousInd, t.LineId);
+                    }
+                }
+            }
+            RememberOrders();
+            return moved;
+        }
+
+        private static string MovedText(int moved)
+        {
+            if (moved == 1) return " Moved the selected working order.";
+            if (moved > 1) return " Moved " + moved + " checked working orders.";
+            return " No working order was moved.";
+        }
+
+        private NinjaTrader.Gui.NinjaScript.IndicatorRenderBase PriceIndicator()
+        {
+            KcSource src = PriceSource();
+            return src == null ? null : src.Indicator;
+        }
+
+        private void StampLine(TrackedOrder t, TrackedOrder carry)
+        {
+            if (t == null) return;
+            if (carry != null && carry.LinePlotSet)
+            {
+                t.LinePlot = carry.LinePlot;
+                t.LinePlotSet = true;
+                t.LineInd = carry.LineInd;
+                t.LineId = carry.LineId;
+                return;
+            }
+            int plot = ConcretePlot(selectedPlot);
+            if (plot == int.MinValue) return;
+            KcSource src = PriceSource();
+            t.LinePlot = plot;
+            t.LinePlotSet = true;
+            t.LineInd = src == null ? null : src.Indicator;
+            t.LineId = IdOf(t.LineInd, t.LineId);
         }
 
         private void ApplyLineButtons(string lineName)
@@ -2805,7 +3066,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             lineCombo = new System.Windows.Controls.ComboBox
             {
                 Height = 24, MinWidth = 0, HorizontalAlignment = HorizontalAlignment.Stretch,
-                ToolTip = "Keltner plot the orders follow. Midline is selected by default. With MACD in Track, this line is still the order price and MACD is only the trigger."
+                ToolTip = "Keltner plot for new orders, and for the checked not-filled orders. Other working orders keep their own line. Midline is selected by default. With MACD in Track, this line is still the order price and MACD is only the trigger."
             };
             lineCombo.SelectionChanged += OnLineComboChanged;
             System.Windows.Controls.Grid.SetColumn(lineLabel, 0);
@@ -2972,9 +3233,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             filledListPanel = new System.Windows.Controls.StackPanel();
             doneListPanel = new System.Windows.Controls.StackPanel();
             System.Windows.Controls.StackPanel orderLists = new System.Windows.Controls.StackPanel();
-            orderLists.Children.Add(MakeOrderSection("Not filled", "Working orders that are not filled.", nfListPanel));
+            orderLists.Children.Add(MakeOrderSection("Not filled", "Working orders that are not filled, including Buy @, Sell @, and Chart Trader Mkt, Bid, and Ask. Check one to change its stop or target from the Chart Trader ATM strategy or from SL / TP. Check two or more and set them together to put the same line or value on each. Orders that are not checked keep their own.", nfListPanel));
             orderLists.Children.Add(MakeOrderDivider());
-            orderLists.Children.Add(MakeOrderSection("Filled", "Filled orders still open. Check one to set its stop or target, or to include it when the ATM strategy changes.", filledListPanel));
+            orderLists.Children.Add(MakeOrderSection("Filled", "Filled orders still open, including Chart Trader Mkt, Bid, and Ask. Check one to set its stop or target, or to include it when the ATM strategy changes.", filledListPanel));
             legButton = new System.Windows.Controls.Button
             {
                 Content = "SL / TP",
@@ -2984,12 +3245,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Background = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
                 Foreground = Brushes.White,
                 Visibility = Visibility.Collapsed,
-                ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close the position when MACD crosses an absolute level."
+                ToolTip = "On one checked order, filled or not filled: remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close the position when MACD crosses an absolute level. On two or more checked not-filled orders, the same choice is applied to each."
             };
             legButton.Click += OnLegButtonClick;
             orderLists.Children.Add(legButton);
             orderLists.Children.Add(MakeOrderDivider());
-            orderLists.Children.Add(MakeOrderSection("Completed", "Closed trades. W is a win and L is a loss. The last number is points (4 ticks = 1 point).", doneListPanel));
+            orderLists.Children.Add(MakeOrderSection("Completed", "Closed trades, including Chart Trader Mkt, Bid, and Ask. W is a win and L is a loss. The last number is points (4 ticks = 1 point).", doneListPanel));
             System.Windows.Controls.Border orderListBorder = new System.Windows.Controls.Border
             {
                 Child = orderLists,
@@ -3847,6 +4108,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             return true;
         }
 
+        private void HookAllAccounts()
+        {
+            Account[] accts;
+            try { lock (Account.All) accts = Account.All.ToArray(); }
+            catch { return; }
+            foreach (Account acct in accts)
+                HookAccount(acct);
+        }
+
         private void HookAccount(Account acct)
         {
             if (acct == null) return;
@@ -3890,7 +4160,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                     "ChartTraderControlBuyBidButton",
                     "ChartTraderControlSellBidButton",
                     "ChartTraderControlBuyAskButton",
-                    "ChartTraderControlSellAskButton"
+                    "ChartTraderControlSellAskButton",
+                    "buyMarketButton",
+                    "sellMarketButton",
+                    "buyBidButton",
+                    "sellBidButton",
+                    "buyAskButton",
+                    "sellAskButton"
                 };
                 foreach (string id in ids)
                 {
@@ -3906,6 +4182,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     NinjaTrader.Gui.Chart.ChartTrader ct =
                         chartWindow.FindFirst("ChartWindowChartTraderControl") as NinjaTrader.Gui.Chart.ChartTrader;
                     if (ct != null) WalkQuickButtons(ct);
+                    if (quickButtons.Count < 6) WalkQuickButtons(chartWindow);
                 }
             }
             catch (Exception ex) { Print("KcMidTrader quick button error: " + ex.Message); }
@@ -3980,8 +4257,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (match == null) return;
 
             Account acct = SelectedAccount();
-            if (acct == null) return;
-            HookAccount(acct);
+            if (acct != null) HookAccount(acct);
+            else HookAllAccounts();
             NinjaTrader.NinjaScript.AtmStrategy atm = SelectedAtm();
             string key = atm == null ? "" : AtmTemplateKey(atm);
             if (key == null) key = "";
@@ -4004,8 +4281,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private List<Order> SnapshotInstrumentOrders(Account acct)
         {
+            if (acct == null || Instrument == null) return null;
             List<Order> seen = new List<Order>();
-            if (acct == null || Instrument == null) return seen;
             try
             {
                 Order[] orders;
@@ -4013,7 +4290,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 foreach (Order existing in orders)
                 {
                     if (existing == null || existing.Instrument == null) continue;
-                    if (existing.Instrument.FullName != Instrument.FullName) continue;
+                    if (!SameInstrument(existing.Instrument)) continue;
                     seen.Add(existing);
                 }
             }
@@ -4151,12 +4428,14 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 PendingQuick pending = pendingQuick[i];
                 if (pending.IsBuy != buy) continue;
-                if (!SameAccount(pending.Account, orderAccount)) continue;
+                if (pending.Account != null && !SameAccount(pending.Account, orderAccount)) continue;
+                // Buy Ask and Sell Bid are often sent as a market order. Buy Mkt stays a market order.
                 if (pending.Mode == QuickMode.Mkt)
                 {
                     if (o.OrderType != OrderType.Market) continue;
                 }
-                else if (o.OrderType != OrderType.Limit)
+                else if (o.OrderType != OrderType.Limit && o.OrderType != OrderType.Market
+                    && o.OrderType != OrderType.StopLimit)
                     continue;
                 if (pending.Seen != null)
                 {
@@ -4257,7 +4536,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             string key;
             lock (sync)
             {
-                if (!t.QuickEntry || t.QuickBracketsPlaced || t.Completed) return;
+                if (!t.QuickEntry || t.QuickBracketsPlaced || t.Completed || t.BracketSet) return;
                 if (t.Order == null || t.Order.Filled <= 0) return;
                 if (t.FillPrice <= 0 && t.Order.AverageFillPrice <= 0) return;
                 string name = t.Order.Name ?? "";
@@ -4297,7 +4576,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (e == null || e.Execution == null) return;
             Execution ex = e.Execution;
-            if (ex.Instrument == null || Instrument == null || ex.Instrument.FullName != Instrument.FullName) return;
+            if (ex.Instrument == null || !SameInstrument(ex.Instrument)) return;
             SyncOrderList();
         }
 
@@ -4305,33 +4584,51 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (e == null || e.Order == null) return;
             Order o = e.Order;
-            if (o.Instrument == null || Instrument == null || o.Instrument.FullName != Instrument.FullName) return;
+            if (o.Instrument == null || !SameInstrument(o.Instrument)) return;
 
             bool ours = false;
+            bool adopted = false;
             TrackedOrder quick = null;
+            TrackedOrder opened = null;
             lock (sync)
             {
                 foreach (TrackedOrder t in tracked)
                 {
                     if (t.Order != o) continue;
                     ours = true;
+                    bool firstFill = o.Filled > 0 && !t.EntryFilled && t.BracketSet;
                     NoteFill(t);
+                    if (firstFill) opened = t;
                     try
                     {
                         NinjaTrader.NinjaScript.StrategyBase owner = o.GetOwnerStrategy();
                         if (owner != null) t.AtmOwner = owner;
                     }
                     catch { }
+                    // The ATM builds its own stop and target on the fill. Wait for them before this
+                    // tool places stored ones, or the fill ends up with two sets of working orders.
+                    if (firstFill && (t.AtmOwner != null || !string.IsNullOrEmpty(t.AtmName)))
+                        t.AtmGraceUntil = DateTime.UtcNow.AddSeconds(2);
                     if (t.QuickEntry) quick = t;
                     break;
                 }
                 if (!ours)
+                {
                     quick = TryAdoptQuickEntry(o, sender as Account);
+                    adopted = quick != null;
+                }
             }
             if (quick != null)
                 ScheduleQuickEntry(quick);
+            if (adopted)
+            {
+                string where = IsListedFilled(quick) ? "Filled" : "Not filled";
+                SetStatus((quick.Label ?? "Order") + " added to " + where + ".");
+            }
             else if (!ours)
                 LinkChildOrder(o);
+            if (opened != null)
+                ScheduleStoredBrackets(opened);
 
             if (o.OrderState == OrderState.Cancelled || o.OrderState == OrderState.Rejected)
                 OnProtectiveState(o);
@@ -4354,6 +4651,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             catch { owner = null; }
 
             Account rejectAccount = null;
+            TrackedOrder shapeOrder = null;
             lock (sync)
             {
                 if (tracked.Any(t => ContainsOrder(t.StopOrders, o) || ContainsOrder(t.TargetOrders, o)))
@@ -4378,8 +4676,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     foreach (TrackedOrder t in tracked)
                     {
-                        if (t.Account != o.Account || t.Order == null || t.Order.Filled <= 0) continue;
-                        if (t.AtmTemplate == null && t.AtmOwner == null) continue;
+                        if (t.Account != o.Account || t.Order == null) continue;
+                        if (t.Order.Filled <= 0 && !IsChangeable(t.Order)) continue;
+                        if (t.AtmTemplate == null && t.AtmOwner == null && string.IsNullOrEmpty(t.AtmName)) continue;
                         if (HasChildNamed(t, name) && !RejectsChild(t, stop)) continue;
                         if (match == null || t.Order.Time > match.Order.Time)
                             match = t;
@@ -4387,17 +4686,22 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
                 if (match == null) return;
                 if (match.AtmOwner == null && owner != null) match.AtmOwner = owner;
-                if (RejectsChild(match, stop))
+                // A working order can already be holding the stop or target the user confirmed.
+                // The ATM copy that appears on the fill is cancelled so the order keeps one bracket.
+                bool already = match.BracketSet && HasOpenChild(stop ? match.StopOrders : match.TargetOrders);
+                if (RejectsChild(match, stop) || already)
                     rejectAccount = match.Account;
                 else
                 {
                     if (stop) match.StopOrders.Add(o);
                     else match.TargetOrders.Add(o);
                     NoteFill(match);
-                    return;
+                    if (match.BracketSet) shapeOrder = match;
                 }
             }
 
+            if (shapeOrder != null)
+                ShapeLinkedLeg(shapeOrder, stop);
             if (rejectAccount == null || !IsChangeable(o)) return;
             try { rejectAccount.Cancel(new[] { o }); }
             catch (Exception ex) { Print("KcMidTrader leg cancel error: " + ex.Message); }
@@ -4598,8 +4902,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             catch { return false; }
         }
 
-        // NF entries are cancelled and resubmitted on the newly selected template.
-        // Checked filled orders get new prices only on legs that are still on the ATM.
+        // Checked not-filled orders take the newly selected template. Unchecked ones keep theirs.
+        // Two or more checked not-filled orders share that template. Checked filled orders get
+        // new prices only on legs that are still on the ATM.
         private void ApplyAtmChange(string key, NinjaTrader.NinjaScript.AtmStrategy atm)
         {
             if (key == null) return;
@@ -4608,29 +4913,40 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             List<TrackedOrder> toCancel = new List<TrackedOrder>();
             List<TrackedOrder> toReprice = new List<TrackedOrder>();
+            int armed = 0;
             lock (sync)
             {
                 foreach (TrackedOrder t in tracked)
                 {
-                    if (t.PendingReplace || t.Order == null) continue;
+                    if (t.PendingReplace || t.Completed) continue;
                     bool same = string.Equals(t.AtmName ?? "", key, StringComparison.OrdinalIgnoreCase);
+                    bool armedEntry = t.Order == null && (t.WaitMacd || t.WaitCross);
+                    if (armedEntry)
+                    {
+                        if (!t.SelectedForAtm || (same && !t.BracketSet)) continue;
+                        AdoptSelectedAtm(t, key, atm);
+                        armed++;
+                        continue;
+                    }
+                    if (t.Order == null) continue;
                     bool openEntry = t.Order.Filled == 0 && !Order.IsTerminalState(t.Order.OrderState)
                         && t.Order.OrderState != OrderState.CancelPending;
                     if (openEntry)
                     {
                         // A market entry has no resting price. A Chart Trader Mkt, Bid, or Ask
                         // order is not a midline order, so it is not cancelled and sent again.
-                        if (same || t.QuickEntry || t.Order.OrderType == OrderType.Market) continue;
+                        // An unchecked not-filled order keeps the ATM and stop or target it already has.
+                        if (!t.SelectedForAtm || t.QuickEntry || t.Order.OrderType == OrderType.Market) continue;
+                        if (same && !t.BracketSet) continue;
                         double px = t.Order.OrderType == OrderType.Limit ? t.Order.LimitPrice : t.Order.StopPrice;
                         t.PendingReplace = true;
                         t.SwapAtm = true;
                         t.ReplaceAtmName = key;
                         t.ReplaceAtm = key.Length == 0 ? null : atm;
                         t.ReplacePrice = px;
-                        t.FollowAtm = true;
                         toCancel.Add(t);
                     }
-                    else if (t.Order.Filled > 0 && t.SelectedForAtm && !t.Completed && !same
+                    else if (t.Order.Filled > 0 && t.SelectedForAtm && !same
                         && ((t.StopSource == LegFollow.Atm && HasWorkingChild(t.StopOrders))
                             || (t.TargetSource == LegFollow.Atm && HasWorkingChild(t.TargetOrders))))
                         toReprice.Add(t);
@@ -4659,13 +4975,18 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
             }
 
-            if (toCancel.Count == 0 && toReprice.Count == 0)
+            int selectedOpen = toCancel.Count + armed;
+            if (selectedOpen == 0 && toReprice.Count == 0)
                 return;
 
             string template = key.Length == 0 ? "no ATM" : key;
-            string text = string.Format("{0} NF entr{1} set to {2}. {3} selected ATM stop/target order{4} changed.",
-                toCancel.Count, toCancel.Count == 1 ? "y" : "ies", template,
-                changed, changed == 1 ? "" : "s");
+            string text = "";
+            if (selectedOpen > 0)
+                text = string.Format("{0} selected not-filled order{1} set to {2}.",
+                    selectedOpen, selectedOpen == 1 ? "" : "s", template);
+            if (changed > 0)
+                text += (text.Length == 0 ? "" : " ") + string.Format("{0} selected filled stop/target order{1} changed.",
+                    changed, changed == 1 ? "" : "s");
             if (atm == null && toReprice.Count > 0)
                 text += " Placed stops and targets were left unchanged.";
             if (notes.Count > 0)
@@ -4674,15 +4995,46 @@ namespace NinjaTrader.NinjaScript.Indicators
             SyncOrderList();
         }
 
+        // The checked not-filled order takes this ATM. A previous indicator line or value is replaced,
+        // so orders configured together follow the same strategy. An EMA-cross arm keeps its cross target.
+        private static void AdoptSelectedAtm(TrackedOrder t, string key, NinjaTrader.NinjaScript.AtmStrategy atm)
+        {
+            if (t == null) return;
+            bool keepCross = t.WaitCross;
+            t.AtmName = key ?? "";
+            t.AtmTemplate = t.AtmName.Length > 0 ? atm : null;
+            t.FollowAtm = t.AtmName.Length > 0;
+            t.BracketSet = false;
+            t.BracketAnchor = 0;
+            t.StopSource = LegFollow.Atm;
+            t.StopIndicator = null;
+            t.StopPaused = false;
+            t.StopMissing = false;
+            t.StopMacdSet = false;
+            t.TargetIndicator = null;
+            t.TargetMacdSet = false;
+            t.TargetPaused = false;
+            t.TargetMissing = false;
+            t.TargetCrossSent = false;
+            t.TargetCrossPending = false;
+            if (keepCross)
+                t.TargetSource = LegFollow.EmaCross;
+            else
+            {
+                t.TargetSource = LegFollow.Atm;
+                t.TargetEmaA = null;
+                t.TargetEmaB = null;
+            }
+        }
+
         private int RepriceProtective(TrackedOrder t, NinjaTrader.NinjaScript.AtmStrategy atm, List<string> notes,
                                       bool includeStops, bool includeTargets)
         {
             if (!includeStops && !includeTargets) return 0;
-            double fill = t.FillPrice;
-            if (fill <= 0 && t.Order != null) fill = t.Order.AverageFillPrice;
+            double fill = EntryAnchor(t);
             if (fill <= 0)
             {
-                notes.Add((t.Label ?? "Order") + " has no fill price yet.");
+                notes.Add((t.Label ?? "Order") + (EntryIsFilled(t) ? " has no fill price yet." : " has no price yet."));
                 return 0;
             }
 
@@ -4781,6 +5133,17 @@ namespace NinjaTrader.NinjaScript.Indicators
             return false;
         }
 
+        private static bool HasOpenChild(List<Order> orders)
+        {
+            if (orders == null) return false;
+            for (int i = 0; i < orders.Count; i++)
+            {
+                Order o = orders[i];
+                if (o != null && !Order.IsTerminalState(o.OrderState)) return true;
+            }
+            return false;
+        }
+
         // Long stop and short target stay below the market. Short stop and long target stay above it.
         private bool ProtectiveOnRestingSide(bool isLong, bool isStop, double price)
         {
@@ -4803,13 +5166,130 @@ namespace NinjaTrader.NinjaScript.Indicators
             lock (sync) orders = tracked.ToList();
             foreach (TrackedOrder t in orders)
             {
-                if (t.Completed || t.Order == null || t.Order.Filled <= 0) continue;
-                if (t.StopSource == LegFollow.Indicator)
+                if (t.Completed || t.Order == null) continue;
+                bool filled = t.Order.Filled > 0;
+                bool workingEntry = !filled && IsChangeable(t.Order);
+                if (!filled && !workingEntry) continue;
+
+                bool followStop = t.StopSource == LegFollow.Indicator;
+                bool followTarget = t.TargetSource == LegFollow.Indicator;
+                bool moveAtm = t.BracketSet
+                    && (workingEntry || filled)
+                    && (t.StopSource == LegFollow.Atm || t.TargetSource == LegFollow.Atm);
+                bool needStop;
+                bool needTarget;
+                lock (sync)
+                {
+                    needStop = (followStop || (moveAtm && t.StopSource == LegFollow.Atm))
+                        && !HasWorkingChild(t.StopOrders);
+                    needTarget = (followTarget || (moveAtm && t.TargetSource == LegFollow.Atm))
+                        && !HasWorkingChild(t.TargetOrders);
+                }
+                if (needStop) AttachWorkingLegs(t, true);
+                if (needTarget) AttachWorkingLegs(t, false);
+                if (followStop)
                     ReportFollow(FollowLeg(t, true, barIndex));
-                if (t.TargetSource == LegFollow.Indicator)
+                if (followTarget)
                     ReportFollow(FollowLeg(t, false, barIndex));
-                // EMA cross is closed-bar only, in TrackEmaCrossNow. A forming bar must not open and close the same trade.
+                if (moveAtm)
+                    ReportFollow(MoveWorkingAtm(t));
+                EnsureStoredBrackets(t);
             }
+        }
+
+        // A choice confirmed while the order was working, before its stop or target could rest.
+        private void EnsureStoredBrackets(TrackedOrder t)
+        {
+            if (t == null || !t.BracketSet || t.Completed || !EntryIsFilled(t)) return;
+            TryEnsureLeg(t, true);
+            TryEnsureLeg(t, false);
+        }
+
+        private void TryEnsureLeg(TrackedOrder t, bool isStop)
+        {
+            LegFollow source;
+            bool open;
+            lock (sync)
+            {
+                source = isStop ? t.StopSource : t.TargetSource;
+                open = HasOpenChild(isStop ? t.StopOrders : t.TargetOrders);
+            }
+            if (open) return;
+            if (source != LegFollow.Atm && source != LegFollow.Indicator) return;
+            if (InAtmGrace(t)) return;
+            string error = source == LegFollow.Indicator ? PlaceStoredIndicator(t, isStop) : PlaceStoredAtmLeg(t, isStop);
+            if (string.IsNullOrEmpty(error) || IsWaitingSide(error)) return;
+            if (error.IndexOf("no value", StringComparison.OrdinalIgnoreCase) >= 0) return;
+            if (error.IndexOf("no quantity", StringComparison.OrdinalIgnoreCase) >= 0) return;
+            if (error.IndexOf("no price", StringComparison.OrdinalIgnoreCase) >= 0) return;
+            if (error.IndexOf("no fill", StringComparison.OrdinalIgnoreCase) >= 0) return;
+        }
+
+        private void ShapeLinkedLeg(TrackedOrder t, bool isStop)
+        {
+            if (t == null || !t.BracketSet) return;
+            try
+            {
+                LegFollow source;
+                lock (sync) source = isStop ? t.StopSource : t.TargetSource;
+                if (source == LegFollow.Indicator)
+                {
+                    string note = FollowLeg(t, isStop, CurrentBar);
+                    if (!string.IsNullOrEmpty(note)) SetStatus(note);
+                    return;
+                }
+                if (source != LegFollow.Atm) return;
+                NinjaTrader.NinjaScript.AtmStrategy atm = TemplateOf(t);
+                if (atm == null) return;
+                List<string> notes = new List<string>();
+                RepriceProtective(t, atm, notes, isStop, !isStop);
+                if (notes.Count > 0) SetStatus(notes[0]);
+            }
+            catch (Exception ex) { Print("KcMidTrader SL/TP link error: " + ex.Message); }
+        }
+
+        private NinjaTrader.NinjaScript.AtmStrategy TemplateOf(TrackedOrder t)
+        {
+            if (t == null) return null;
+            NinjaTrader.NinjaScript.AtmStrategy atm = t.AtmTemplate;
+            if (atm == null && liveAtm != null && !string.IsNullOrEmpty(t.AtmName)
+                && string.Equals(AtmTemplateKey(liveAtm) ?? "", t.AtmName, StringComparison.OrdinalIgnoreCase))
+                atm = liveAtm;
+            return atm;
+        }
+
+        private static bool IsWaitingSide(string error)
+        {
+            return !string.IsNullOrEmpty(error)
+                && error.IndexOf("wrong side of the market", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // ATM distances stay tied to a working entry's price. Once it fills, the fill price is the anchor.
+        private string MoveWorkingAtm(TrackedOrder t)
+        {
+            if (t == null || !t.BracketSet || t.Order == null) return null;
+            if (t.Order.Filled <= 0 && !IsChangeable(t.Order)) return null;
+            double anchor = EntryAnchor(t);
+            if (anchor <= 0) return null;
+            NinjaTrader.NinjaScript.AtmStrategy atm = TemplateOf(t);
+            if (atm == null) return null;
+
+            bool stops;
+            bool targets;
+            lock (sync)
+            {
+                stops = t.StopSource == LegFollow.Atm && HasWorkingChild(t.StopOrders);
+                targets = t.TargetSource == LegFollow.Atm && HasWorkingChild(t.TargetOrders);
+            }
+            if (!stops && !targets) return null;
+
+            double previous = t.BracketAnchor;
+            List<string> notes = new List<string>();
+            RepriceProtective(t, atm, notes, stops, targets);
+            t.BracketAnchor = anchor;
+            if (notes.Count > 0 && anchor.ApproxCompare(previous) != 0)
+                return notes[0];
+            return null;
         }
 
         private void ReportFollow(string note)
@@ -5114,7 +5594,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void AssignExit(List<ExitScan> scans, Execution ex)
         {
             if (ex == null || ex.Quantity <= 0 || ex.Price <= 0) return;
-            if (ex.Instrument == null || Instrument == null || ex.Instrument.FullName != Instrument.FullName) return;
+            if (ex.Instrument == null || !SameInstrument(ex.Instrument)) return;
 
             int left = ex.Quantity;
             for (int i = 0; i < scans.Count && left > 0; i++)
@@ -5225,7 +5705,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                         filled.Add(row);
                     }
                     else
+                    {
+                        row.Checkable = true;
+                        row.Checked = t.SelectedForAtm;
                         nf.Add(row);
+                    }
                 }
             }
 
@@ -5305,54 +5789,59 @@ namespace NinjaTrader.NinjaScript.Indicators
             UpdateLegButton();
         }
 
-        private TrackedOrder SoleSelectedFilled()
+        // One checked order, filled or not filled, is edited alone. Two or more checked not-filled
+        // orders are edited together. A checked fill mixed with other checks is left alone.
+        private List<TrackedOrder> LegDialogTargets()
         {
-            TrackedOrder only = null;
-            int n = 0;
+            List<TrackedOrder> selected = new List<TrackedOrder>();
+            int filled = 0;
+            int open = 0;
             lock (sync)
             {
                 foreach (TrackedOrder t in tracked)
                 {
-                    if (!t.SelectedForAtm || t.Completed || !IsListedFilled(t)) continue;
-                    n++;
-                    only = t;
+                    if (!t.SelectedForAtm || t.Completed) continue;
+                    selected.Add(t);
+                    if (IsListedFilled(t)) filled++;
+                    else open++;
                 }
             }
-            return n == 1 ? only : null;
+            if (selected.Count == 1) return selected;
+            if (open >= 2 && filled == 0) return selected;
+            return new List<TrackedOrder>();
         }
 
         private void UpdateLegButton()
         {
             if (legButton == null) return;
-            TrackedOrder only = SoleSelectedFilled();
-            if (only == null)
+            List<TrackedOrder> targets = LegDialogTargets();
+            if (targets.Count == 0)
             {
                 legButton.Visibility = Visibility.Collapsed;
                 return;
             }
             legButton.Visibility = Visibility.Visible;
             legButton.IsEnabled = true;
-            legButton.ToolTip = "Remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close the position when MACD crosses an absolute level.";
+            legButton.ToolTip = targets.Count == 1
+                ? "On this order: remove the stop or target, keep them on the ATM, follow an indicator, close the target when two EMAs cross, or close the position when MACD crosses an absolute level."
+                : "On these " + targets.Count + " checked not-filled orders: the same stop and target. They follow the same line or value.";
         }
 
         private void OnLegButtonClick(object sender, RoutedEventArgs e)
         {
             DetectKeltner();
-            TrackedOrder t = SoleSelectedFilled();
+            List<TrackedOrder> targets = LegDialogTargets();
             UpdateLegButton();
-            if (t == null || legButton == null || !legButton.IsEnabled) return;
-            ShowLegDialog(t);
+            if (targets.Count == 0 || legButton == null || !legButton.IsEnabled) return;
+            ShowLegDialog(targets);
         }
 
         private bool ShowEmaCrossDialog()
         {
-            List<KcSource> sources = CollectSources(false, null);
-            List<KcSource> emas = new List<KcSource>();
-            foreach (KcSource k in sources)
-                if (IsEma(k)) emas.Add(k);
-            if (emas.Count < 2)
+            List<KcSource> lines = CrossChoices(CollectSources(false, null));
+            if (lines.Count < 2)
             {
-                SetStatusNow("EMA cross needs two EMAs.");
+                SetStatusNow("EMA cross needs two EMAs, or an EMA and a Keltner.");
                 return false;
             }
 
@@ -5364,7 +5853,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
                 ResizeMode = ResizeMode.NoResize,
                 SizeToContent = SizeToContent.WidthAndHeight,
-                Width = 460,
+                Width = 640,
                 Background = Brushes.White,
                 ShowInTaskbar = false
             };
@@ -5372,7 +5861,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             System.Windows.Controls.StackPanel root = new System.Windows.Controls.StackPanel { Margin = new Thickness(12) };
             root.Children.Add(new System.Windows.Controls.TextBlock
             {
-                Text = "Buy opens when EMA A crosses above EMA B. Sell opens when EMA A crosses below EMA B. A cross that is already true does not open or close.",
+                Text = "Buy opens when EMA A crosses above EMA B. Sell opens when EMA A crosses below EMA B. A cross that is already true does not open or close. EMA A starts on EMA(9) and EMA B on EMA(20) when those EMAs are on the chart. When a Keltner Channel is on the chart, EMA A or EMA B can be that Keltner. The line starts on Midline.",
                 TextWrapping = TextWrapping.Wrap,
                 Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
                 Margin = new Thickness(0, 0, 0, 8)
@@ -5381,17 +5870,20 @@ namespace NinjaTrader.NinjaScript.Indicators
             System.Windows.Controls.Grid grid = new System.Windows.Controls.Grid { Margin = new Thickness(0, 4, 0, 4) };
             grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
             grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
             grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
             grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
 
             System.Windows.Controls.ComboBox emaA = new System.Windows.Controls.ComboBox { MinWidth = 220, Margin = new Thickness(8, 2, 0, 2) };
             System.Windows.Controls.ComboBox emaB = new System.Windows.Controls.ComboBox { MinWidth = 220, Margin = new Thickness(8, 2, 0, 2) };
+            System.Windows.Controls.ComboBox bandA = CrossBandBox();
+            System.Windows.Controls.ComboBox bandB = CrossBandBox();
             bool emaBusy = false;
             System.Windows.Controls.SelectionChangedEventHandler onEma = delegate
             {
                 if (emaBusy) return;
                 emaBusy = true;
-                try { SyncExclusiveEmas(emaA, emaB, emas, null, null); }
+                try { SyncCrossSides(emaA, emaB, bandA, bandB, lines); }
                 finally { emaBusy = false; }
             };
             emaA.SelectionChanged += onEma;
@@ -5401,16 +5893,24 @@ namespace NinjaTrader.NinjaScript.Indicators
             System.Windows.Controls.Grid.SetRow(aLabel, 0);
             System.Windows.Controls.Grid.SetRow(emaA, 0);
             System.Windows.Controls.Grid.SetColumn(emaA, 1);
+            System.Windows.Controls.Grid.SetRow(bandA, 0);
+            System.Windows.Controls.Grid.SetColumn(bandA, 2);
             System.Windows.Controls.Grid.SetRow(bLabel, 1);
             System.Windows.Controls.Grid.SetRow(emaB, 1);
             System.Windows.Controls.Grid.SetColumn(emaB, 1);
+            System.Windows.Controls.Grid.SetRow(bandB, 1);
+            System.Windows.Controls.Grid.SetColumn(bandB, 2);
             grid.Children.Add(aLabel);
             grid.Children.Add(emaA);
+            grid.Children.Add(bandA);
             grid.Children.Add(bLabel);
             grid.Children.Add(emaB);
+            grid.Children.Add(bandB);
             emaBusy = true;
-            try { SyncExclusiveEmas(emaA, emaB, emas, crossEmaA, crossEmaB); }
+            try { SyncExclusiveEmas(emaA, emaB, lines, crossEmaA, crossEmaB); }
             finally { emaBusy = false; }
+            ApplyCrossBand(emaA, bandA, crossEmaAPlot);
+            ApplyCrossBand(emaB, bandB, crossEmaBPlot);
             root.Children.Add(grid);
 
             System.Windows.Controls.TextBlock errorText = new System.Windows.Controls.TextBlock
@@ -5440,21 +5940,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 FollowPick a = emaA.SelectedItem as FollowPick;
                 FollowPick b = emaB.SelectedItem as FollowPick;
-                if (a == null || b == null || a.Source == null || b.Source == null
-                    || a.Source.Indicator == null || b.Source.Indicator == null)
+                string error = ValidateCrossPicks(a, b, bandA, bandB);
+                if (error != null)
                 {
-                    errorText.Text = "Choose the two EMAs.";
-                    return;
-                }
-                if (ReferenceEquals(a.Source.Indicator, b.Source.Indicator))
-                {
-                    errorText.Text = "Choose two different EMAs.";
+                    errorText.Text = error;
                     return;
                 }
                 crossEmaA = a.Source.Indicator;
                 crossEmaB = b.Source.Indicator;
-                crossEmaAName = a.Text;
-                crossEmaBName = b.Text;
+                crossEmaAPlot = PlotOfCross(a, bandA);
+                crossEmaBPlot = PlotOfCross(b, bandB);
+                crossEmaAName = NameOfCross(a, bandA);
+                crossEmaBName = NameOfCross(b, bandB);
                 crossConfigured = true;
                 accepted = true;
                 win.DialogResult = true;
@@ -5468,13 +5965,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             return accepted;
         }
 
-        private void ShowLegDialog(TrackedOrder t)
+        private void ShowLegDialog(List<TrackedOrder> targets)
         {
-            if (t == null || t.Completed) return;
+            if (targets == null || targets.Count == 0) return;
+            TrackedOrder sample = targets[0];
+            if (sample == null || sample.Completed) return;
 
             Window win = new Window
             {
-                Title = "Stop and target",
+                Title = targets.Count == 1 ? "Stop and target" : "Stop and target for " + targets.Count + " orders",
                 Owner = chartWindow,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
                 ResizeMode = ResizeMode.NoResize,
@@ -5485,10 +5984,21 @@ namespace NinjaTrader.NinjaScript.Indicators
             };
 
             System.Windows.Controls.StackPanel root = new System.Windows.Controls.StackPanel { Margin = new Thickness(12) };
+            if (targets.Count > 1)
+            {
+                root.Children.Add(new System.Windows.Controls.TextBlock
+                {
+                    Text = "This stop and target is applied to the " + targets.Count
+                        + " checked not-filled orders. They follow the same line or value. Orders that are not checked stay as they are.",
+                    TextWrapping = TextWrapping.Wrap,
+                    Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
+                    Margin = new Thickness(0, 0, 0, 8)
+                });
+            }
             List<KcSource> sources = CollectSources(false, null);
             List<LegDialogRow> rows = new List<LegDialogRow>();
-            rows.Add(BuildLegRow(win, root, "Stop", true, t, sources));
-            rows.Add(BuildLegRow(win, root, "Target", false, t, sources));
+            rows.Add(BuildLegRow(win, root, "Stop", true, sample, sources));
+            rows.Add(BuildLegRow(win, root, "Target", false, sample, sources));
 
             System.Windows.Controls.TextBlock errorText = new System.Windows.Controls.TextBlock
             {
@@ -5515,8 +6025,31 @@ namespace NinjaTrader.NinjaScript.Indicators
             };
             confirm.Click += delegate
             {
-                string error;
-                try { error = ApplyLegDialog(t, rows); }
+                string error = null;
+                try
+                {
+                    foreach (TrackedOrder one in targets)
+                    {
+                        error = ValidateLegDialog(one, rows);
+                        if (error == null) continue;
+                        if (targets.Count > 1)
+                            error = (one.Label ?? "Order") + ": " + error;
+                        break;
+                    }
+                    if (error == null)
+                    {
+                        foreach (TrackedOrder one in targets)
+                        {
+                            error = ApplyLegDialog(one, rows, targets.Count == 1);
+                            if (error == null) continue;
+                            if (targets.Count > 1)
+                                error = (one.Label ?? "Order") + ": " + error;
+                            break;
+                        }
+                    }
+                    if (error == null && targets.Count > 1)
+                        SetStatusNow("Stop and target set on " + targets.Count + " not-filled orders. They use the same line or value.");
+                }
                 catch (Exception ex)
                 {
                     Print("KcMidTrader SL/TP apply error: " + ex.Message);
@@ -5558,14 +6091,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             source.Items.Add(new FollowPick { Text = "ATM strategy", Kind = FollowKind.Atm });
             source.Items.Add(new FollowPick { Text = "None", Kind = FollowKind.None });
 
-            List<KcSource> emas = new List<KcSource>();
-            if (!isStop && sources != null)
+            List<KcSource> lines = !isStop ? CrossChoices(sources) : new List<KcSource>();
+            if (!isStop && lines.Count >= 2)
             {
-                foreach (KcSource k in sources)
-                    if (IsEma(k)) emas.Add(k);
                 // Keep this above the indicator names so a long list cannot hide it.
-                if (emas.Count >= 2)
-                    source.Items.Add(new FollowPick { Text = "EMA cross", Kind = FollowKind.EmaCross });
+                source.Items.Add(new FollowPick { Text = "EMA cross", Kind = FollowKind.EmaCross });
             }
             if (sources != null)
                 foreach (KcSource k in sources)
@@ -5574,21 +6104,26 @@ namespace NinjaTrader.NinjaScript.Indicators
             System.Windows.Controls.Grid emaPanel = null;
             System.Windows.Controls.ComboBox emaA = null;
             System.Windows.Controls.ComboBox emaB = null;
+            System.Windows.Controls.ComboBox bandA = null;
+            System.Windows.Controls.ComboBox bandB = null;
             bool emaBusy = false;
-            if (emas.Count >= 2)
+            if (lines.Count >= 2)
             {
                 emaPanel = new System.Windows.Controls.Grid { Margin = new Thickness(64, 0, 0, 4), Visibility = Visibility.Collapsed };
                 emaPanel.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
                 emaPanel.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                emaPanel.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
                 emaPanel.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
                 emaPanel.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
                 emaA = new System.Windows.Controls.ComboBox { MinWidth = 180, Margin = new Thickness(8, 2, 0, 2) };
                 emaB = new System.Windows.Controls.ComboBox { MinWidth = 180, Margin = new Thickness(8, 2, 0, 2) };
+                bandA = CrossBandBox();
+                bandB = CrossBandBox();
                 System.Windows.Controls.SelectionChangedEventHandler onEma = delegate
                 {
                     if (emaBusy) return;
                     emaBusy = true;
-                    try { SyncExclusiveEmas(emaA, emaB, emas, null, null); }
+                    try { SyncCrossSides(emaA, emaB, bandA, bandB, lines); }
                     finally { emaBusy = false; }
                 };
                 emaA.SelectionChanged += onEma;
@@ -5598,16 +6133,22 @@ namespace NinjaTrader.NinjaScript.Indicators
                 System.Windows.Controls.Grid.SetRow(aLabel, 0);
                 System.Windows.Controls.Grid.SetRow(emaA, 0);
                 System.Windows.Controls.Grid.SetColumn(emaA, 1);
+                System.Windows.Controls.Grid.SetRow(bandA, 0);
+                System.Windows.Controls.Grid.SetColumn(bandA, 2);
                 System.Windows.Controls.Grid.SetRow(bLabel, 1);
                 System.Windows.Controls.Grid.SetRow(emaB, 1);
                 System.Windows.Controls.Grid.SetColumn(emaB, 1);
+                System.Windows.Controls.Grid.SetRow(bandB, 1);
+                System.Windows.Controls.Grid.SetColumn(bandB, 2);
                 emaPanel.Children.Add(aLabel);
                 emaPanel.Children.Add(emaA);
+                emaPanel.Children.Add(bandA);
                 emaPanel.Children.Add(bLabel);
                 emaPanel.Children.Add(emaB);
+                emaPanel.Children.Add(bandB);
             }
 
-            int savedPlot;
+            int savedPlot, savedAPlot = 0, savedBPlot = 0;
             NinjaTrader.Gui.NinjaScript.IndicatorRenderBase savedInd, savedA, savedB;
             LegFollow mode;
             bool savedMacd;
@@ -5619,6 +6160,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 savedPlot = isStop ? t.StopPlot : t.TargetPlot;
                 savedA = t.TargetEmaA;
                 savedB = t.TargetEmaB;
+                savedAPlot = t.TargetEmaAPlot;
+                savedBPlot = t.TargetEmaBPlot;
                 savedMacd = isStop ? t.StopMacdSet : t.TargetMacdSet;
                 savedMacdLevel = isStop ? t.StopMacdLevel : t.TargetMacdLevel;
             }
@@ -5629,6 +6172,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 BandBox = band,
                 EmaABox = emaA,
                 EmaBBox = emaB,
+                EmaABand = bandA,
+                EmaBBand = bandB,
                 EmaPanel = emaPanel,
                 MacdButton = macdButton
             };
@@ -5706,8 +6251,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (emaA != null)
                 {
                     emaBusy = true;
-                    try { SyncExclusiveEmas(emaA, emaB, emas, savedA, savedB); }
+                    try { SyncExclusiveEmas(emaA, emaB, lines, savedA, savedB); }
                     finally { emaBusy = false; }
+                    ApplyCrossBand(emaA, bandA, savedAPlot);
+                    ApplyCrossBand(emaB, bandB, savedBPlot);
                 }
             }
             finally { suppressLegDialog = false; }
@@ -5791,17 +6338,273 @@ namespace NinjaTrader.NinjaScript.Indicators
             return -1;
         }
 
-        // EMA A hides the EMA chosen in B, and EMA B hides the EMA chosen in A.
+        // An EMA, or a Keltner Channel when one is on the chart. The two sides must be different indicators.
+        private bool IsCrossChoice(KcSource src)
+        {
+            return IsEma(src) || IsKeltner(src);
+        }
+
+        private bool IsKeltner(KcSource src)
+        {
+            if (src == null || src.IsEmaCross || src.Indicator == null || IsEma(src) || IsMacd(src)) return false;
+            return IsNamed(src.Indicator, NameFilter());
+        }
+
+        private List<KcSource> CrossChoices(List<KcSource> sources)
+        {
+            List<KcSource> list = new List<KcSource>();
+            if (sources == null) return list;
+            foreach (KcSource k in sources)
+                if (IsCrossChoice(k)) list.Add(k);
+            return list;
+        }
+
+        private static System.Windows.Controls.ComboBox CrossBandBox()
+        {
+            return new System.Windows.Controls.ComboBox
+            {
+                MinWidth = 108,
+                Margin = new Thickness(8, 2, 0, 2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Visibility = Visibility.Collapsed
+            };
+        }
+
+        // Keeps the line already chosen for an indicator that stayed put. A newly chosen Keltner starts on Midline.
+        private void SyncCrossSides(System.Windows.Controls.ComboBox emaA, System.Windows.Controls.ComboBox emaB,
+                                     System.Windows.Controls.ComboBox bandA, System.Windows.Controls.ComboBox bandB,
+                                     List<KcSource> lines)
+        {
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase beforeA = SelectedEma(emaA);
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase beforeB = SelectedEma(emaB);
+            int plotA = SelectedBandPlot(bandA);
+            int plotB = SelectedBandPlot(bandB);
+            SyncExclusiveEmas(emaA, emaB, lines, null, null);
+            ApplyCrossBand(emaA, bandA, ReferenceEquals(SelectedEma(emaA), beforeA) ? plotA : int.MinValue);
+            ApplyCrossBand(emaB, bandB, ReferenceEquals(SelectedEma(emaB), beforeB) ? plotB : int.MinValue);
+        }
+
+        private static int SelectedBandPlot(System.Windows.Controls.ComboBox band)
+        {
+            BandPick pick = band == null ? null : band.SelectedItem as BandPick;
+            return pick == null ? int.MinValue : pick.Plot;
+        }
+
+        private void ApplyCrossBand(System.Windows.Controls.ComboBox ema, System.Windows.Controls.ComboBox band, int prefer)
+        {
+            if (band == null) return;
+            FollowPick pick = ema == null ? null : ema.SelectedItem as FollowPick;
+            if (pick == null || !IsKeltner(pick.Source))
+            {
+                band.Items.Clear();
+                band.Visibility = Visibility.Collapsed;
+                return;
+            }
+            FillCrossBand(band, pick.Source, prefer);
+        }
+
+        // prefer == int.MinValue selects Midline. A saved plot is kept when that line is still on the Keltner.
+        private static void FillCrossBand(System.Windows.Controls.ComboBox band, KcSource src, int prefer)
+        {
+            band.Items.Clear();
+            List<int> plots = new List<int>();
+            List<string> names = new List<string>();
+            CollectKeltnerLines(src, plots, names);
+            if (names.Count == 0)
+            {
+                band.Visibility = Visibility.Collapsed;
+                return;
+            }
+            int midSel = 0;
+            int sel = -1;
+            for (int i = 0; i < names.Count; i++)
+            {
+                band.Items.Add(new BandPick { Text = names[i], Plot = plots[i] });
+                if (string.Equals(names[i], "Midline", StringComparison.OrdinalIgnoreCase)) midSel = i;
+                if (prefer != int.MinValue && plots[i] == prefer) sel = i;
+            }
+            band.SelectedIndex = sel >= 0 ? sel : midSel;
+            band.Visibility = Visibility.Visible;
+        }
+
+        private static void CollectKeltnerLines(KcSource src, List<int> plots, List<string> names)
+        {
+            if (src == null || src.Indicator == null) return;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind = src.Indicator;
+            int mid = src.MidPlot == -2 ? FindMidPlot(ind) : src.MidPlot;
+            if (mid == -2)
+            {
+                int count = ind.Plots == null ? 0 : ind.Plots.Length;
+                if (count >= 3) mid = 0;
+            }
+            AddCrossLine(plots, names, mid, "Midline");
+            AddCrossLine(plots, names, FindNamedPlot(ind, "upper"), "Upper");
+            AddCrossLine(plots, names, FindNamedPlot(ind, "lower"), "Lower");
+        }
+
+        private static void AddCrossLine(List<int> plots, List<string> names, int plot, string name)
+        {
+            if (plot < -1) return;
+            for (int i = 0; i < plots.Count; i++)
+                if (plots[i] == plot) return;
+            plots.Add(plot);
+            names.Add(name);
+        }
+
+        private static int FindNamedPlot(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, string key)
+        {
+            if (ind == null || ind.Plots == null || string.IsNullOrEmpty(key)) return -2;
+            int n = ind.Plots.Length;
+            int values = 0;
+            try { values = ind.Values == null ? 0 : ind.Values.Length; }
+            catch { values = 0; }
+            if (values > 0 && values < n) n = values;
+            for (int i = 0; i < ind.Plots.Length && i < n; i++)
+            {
+                string pn = ind.Plots[i] != null ? (ind.Plots[i].Name ?? "") : "";
+                if (pn.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0) return i;
+            }
+            return -2;
+        }
+
+        private string ValidateCrossPicks(FollowPick a, FollowPick b,
+                                          System.Windows.Controls.ComboBox bandA,
+                                          System.Windows.Controls.ComboBox bandB)
+        {
+            if (a == null || b == null || a.Source == null || b.Source == null
+                || a.Source.Indicator == null || b.Source.Indicator == null)
+                return "Choose EMA A and EMA B.";
+            if (ReferenceEquals(a.Source.Indicator, b.Source.Indicator))
+                return "Choose two different indicators.";
+            if (IsKeltner(a.Source) && SelectedBandPlot(bandA) == int.MinValue)
+                return "Choose the Keltner line for EMA A.";
+            if (IsKeltner(b.Source) && SelectedBandPlot(bandB) == int.MinValue)
+                return "Choose the Keltner line for EMA B.";
+            return null;
+        }
+
+        private int PlotOfCross(FollowPick pick, System.Windows.Controls.ComboBox band)
+        {
+            if (pick != null && IsKeltner(pick.Source))
+            {
+                int plot = SelectedBandPlot(band);
+                if (plot != int.MinValue) return plot;
+            }
+            return 0;
+        }
+
+        private string NameOfCross(FollowPick pick, System.Windows.Controls.ComboBox band)
+        {
+            if (pick == null) return "";
+            if (IsKeltner(pick.Source))
+            {
+                BandPick line = band == null ? null : band.SelectedItem as BandPick;
+                if (line != null && !string.IsNullOrEmpty(line.Text))
+                    return (pick.Text ?? "") + " " + line.Text;
+            }
+            return pick.Text ?? "";
+        }
+
+        // EMA A hides the indicator chosen in B, and EMA B hides the indicator chosen in A.
+        // A side that has no choice yet starts on EMA(9) or EMA(20) when that EMA is on the chart.
         private static void SyncExclusiveEmas(System.Windows.Controls.ComboBox emaA, System.Windows.Controls.ComboBox emaB,
                                                List<KcSource> emas,
                                                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase preferA,
                                                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase preferB)
         {
+            bool unsetA = preferA == null && SelectedEma(emaA) == null;
+            bool unsetB = preferB == null && SelectedEma(emaB) == null;
             if (preferA == null) preferA = SelectedEma(emaA);
             if (preferB == null) preferB = SelectedEma(emaB);
-            if (preferA != null && ReferenceEquals(preferA, preferB)) preferB = null;
+            if (unsetA)
+            {
+                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ema9 = FindEmaPeriod(emas, 9);
+                if (ema9 != null) preferA = ema9;
+            }
+            if (unsetB)
+            {
+                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ema20 = FindEmaPeriod(emas, 20);
+                if (ema20 != null) preferB = ema20;
+            }
+            if (preferA != null && ReferenceEquals(preferA, preferB))
+            {
+                if (unsetA && !unsetB) preferA = null;
+                else preferB = null;
+            }
             FillEmaBox(emaA, emas, preferB, preferA);
             FillEmaBox(emaB, emas, SelectedEma(emaA), preferB);
+        }
+
+        // Stock EMA whose period is 9 or 20. DEMA, TEMA, and ZLEMA are left for a manual choice.
+        private static NinjaTrader.Gui.NinjaScript.IndicatorRenderBase FindEmaPeriod(List<KcSource> lines, int period)
+        {
+            if (lines == null || period <= 0) return null;
+            foreach (KcSource k in lines)
+            {
+                if (!IsPlainEma(k) || EmaPeriodOf(k) != period) continue;
+                return k.Indicator;
+            }
+            return null;
+        }
+
+        private static bool IsPlainEma(KcSource src)
+        {
+            if (!IsEma(src)) return false;
+            string typeName = "";
+            try { typeName = src.Indicator.GetType().Name ?? ""; } catch { typeName = ""; }
+            if (typeName.Equals("EMA", StringComparison.OrdinalIgnoreCase)) return true;
+            if (EmaHead(SafeDisplayName(src.Indicator)).Equals("EMA", StringComparison.OrdinalIgnoreCase)) return true;
+            try { return EmaHead(src.Indicator.Name).Equals("EMA", StringComparison.OrdinalIgnoreCase); }
+            catch { return false; }
+        }
+
+        private static string EmaHead(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return "";
+            string head = text.Trim();
+            int paren = head.IndexOf('(');
+            if (paren >= 0) head = head.Substring(0, paren);
+            return head.Trim();
+        }
+
+        private static int EmaPeriodOf(KcSource src)
+        {
+            if (src == null || src.Indicator == null) return -1;
+            int period = ReadIntProperty(src.Indicator, "Period");
+            if (period > 0) return period;
+            period = FirstPositiveInt(SafeDisplayName(src.Indicator));
+            if (period > 0) return period;
+            try { return FirstPositiveInt(src.Indicator.Name); }
+            catch { return -1; }
+        }
+
+        private static int ReadIntProperty(object target, string name)
+        {
+            if (target == null || string.IsNullOrEmpty(name)) return -1;
+            try
+            {
+                PropertyInfo prop = target.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public);
+                if (prop == null || prop.PropertyType != typeof(int) || !prop.CanRead) return -1;
+                object value = prop.GetValue(target, null);
+                return value is int ? (int)value : -1;
+            }
+            catch { return -1; }
+        }
+
+        private static int FirstPositiveInt(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return -1;
+            int i = 0;
+            while (i < text.Length)
+            {
+                if (!char.IsDigit(text[i])) { i++; continue; }
+                int start = i;
+                while (i < text.Length && char.IsDigit(text[i])) i++;
+                int n;
+                if (int.TryParse(text.Substring(start, i - start), NumberStyles.Integer, CultureInfo.InvariantCulture, out n) && n > 0)
+                    return n;
+            }
+            return -1;
         }
 
         private static NinjaTrader.Gui.NinjaScript.IndicatorRenderBase SelectedEma(System.Windows.Controls.ComboBox box)
@@ -6367,15 +7170,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             band.Visibility = names.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
         }
 
-        private string ApplyLegDialog(TrackedOrder t, List<LegDialogRow> rows)
+        private string ValidateLegDialog(TrackedOrder t, List<LegDialogRow> rows)
         {
             if (t == null || t.Completed) return "That order is already closed.";
             LegDialogRow stopRow = null;
             LegDialogRow targetRow = null;
-            foreach (LegDialogRow row in rows)
+            if (rows != null)
             {
-                if (row.IsStop) stopRow = row;
-                else targetRow = row;
+                foreach (LegDialogRow row in rows)
+                {
+                    if (row.IsStop) stopRow = row;
+                    else targetRow = row;
+                }
             }
             if (stopRow == null || targetRow == null) return "Choose a stop and a target.";
 
@@ -6386,13 +7192,30 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             string error = ValidateLegChoice(t, stopRow, stopPick);
             if (error != null) return error;
-            error = ValidateLegChoice(t, targetRow, targetPick);
+            return ValidateLegChoice(t, targetRow, targetPick);
+        }
+
+        private string ApplyLegDialog(TrackedOrder t, List<LegDialogRow> rows, bool announce)
+        {
+            string error = ValidateLegDialog(t, rows);
             if (error != null) return error;
+            LegDialogRow stopRow = null;
+            LegDialogRow targetRow = null;
+            foreach (LegDialogRow row in rows)
+            {
+                if (row.IsStop) stopRow = row;
+                else targetRow = row;
+            }
+            FollowPick stopPick = stopRow.SourceBox.SelectedItem as FollowPick;
+            FollowPick targetPick = targetRow.SourceBox.SelectedItem as FollowPick;
 
             bool stopMacd = IsMacdFollow(stopPick);
             bool targetMacd = IsMacdFollow(targetPick);
-            bool cancelStop = stopPick.Kind == FollowKind.None || stopMacd;
-            bool cancelTarget = targetPick.Kind == FollowKind.None || targetPick.Kind == FollowKind.EmaCross || targetMacd;
+            // A not-filled entry must not have its own stop or target at the broker: without a position
+            // they are plain BUY / SELL orders. Remove any that were sent and keep only the stored choice.
+            bool filledNow = EntryIsFilled(t);
+            bool cancelStop = !filledNow || stopPick.Kind == FollowKind.None || stopMacd;
+            bool cancelTarget = !filledNow || targetPick.Kind == FollowKind.None || targetPick.Kind == FollowKind.EmaCross || targetMacd;
             AttachWorkingLegs(t, true);
             AttachWorkingLegs(t, false);
             lock (sync)
@@ -6442,39 +7265,49 @@ namespace NinjaTrader.NinjaScript.Indicators
             AddRemovedStatus(parts,
                 stopPick.Kind == FollowKind.None,
                 targetPick.Kind == FollowKind.None,
-                stopCount, targetCount);
+                stopCount, targetCount, EntryIsFilled(t));
 
             error = ApplyKeptLeg(t, stopRow, stopPick, parts);
             if (error != null) return error;
             error = ApplyKeptLeg(t, targetRow, targetPick, parts);
             if (error != null) return error;
-            if (parts.Count > 0) SetStatusNow(string.Join(" ", parts));
+            lock (sync)
+            {
+                t.BracketSet = true;
+                t.BracketAnchor = 0;
+            }
+            // Write the ids now. The next chart pass rebinds from these ids, and a stale Keltner id
+            // would replace the indicator just chosen in this window.
+            CaptureChartIds();
+            RememberOrders();
+            if (announce && parts.Count > 0) SetStatusNow(string.Join(" ", parts));
             return null;
         }
 
-        private static void AddRemovedStatus(List<string> parts, bool stopNone, bool targetNone, int stops, int targets)
+        private static void AddRemovedStatus(List<string> parts, bool stopNone, bool targetNone, int stops, int targets, bool filled)
         {
+            string stay = filled ? "The position stays open." : "The order stays working.";
             if (!stopNone && !targetNone) return;
             if (stopNone && targetNone)
             {
                 if (stops > 0 && targets > 0)
-                    parts.Add("Stop and target removed. The position stays open.");
+                    parts.Add("Stop and target removed. " + stay);
                 else if (stops > 0)
-                    parts.Add("Stop removed. No working target was found. The position stays open.");
+                    parts.Add("Stop removed. No working target was found. " + stay);
                 else if (targets > 0)
-                    parts.Add("No working stop was found. Target removed. The position stays open.");
+                    parts.Add("No working stop was found. Target removed. " + stay);
                 else
-                    parts.Add("No working stop or target was found. The position stays open.");
+                    parts.Add("No working stop or target was found. " + stay);
                 return;
             }
             if (stopNone)
                 parts.Add(stops > 0
-                    ? "Stop removed. The position stays open."
-                    : "No working stop was found. The position stays open.");
+                    ? "Stop removed. " + stay
+                    : "No working stop was found. " + stay);
             if (targetNone)
                 parts.Add(targets > 0
-                    ? "Target removed. The position stays open."
-                    : "No working target was found. The position stays open.");
+                    ? "Target removed. " + stay
+                    : "No working target was found. " + stay);
         }
 
         private string ValidateLegChoice(TrackedOrder t, LegDialogRow row, FollowPick pick)
@@ -6484,11 +7317,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 FollowPick a = row.EmaABox == null ? null : row.EmaABox.SelectedItem as FollowPick;
                 FollowPick b = row.EmaBBox == null ? null : row.EmaBBox.SelectedItem as FollowPick;
-                if (a == null || b == null || a.Source == null || b.Source == null || a.Source.Indicator == null || b.Source.Indicator == null)
-                    return "Choose the two EMAs.";
-                if (ReferenceEquals(a.Source.Indicator, b.Source.Indicator))
-                    return "Choose two different EMAs.";
-                return null;
+                return ValidateCrossPicks(a, b, row.EmaABand, row.EmaBBand);
             }
             if (pick.Kind == FollowKind.Indicator && IsMacd(pick.Source))
             {
@@ -6500,11 +7329,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (pick.Source == null || (row.BandBox.SelectedItem as BandPick) == null)
                     return "Choose a band for " + pick.Text + ".";
                 bool working;
-                lock (sync) working = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+                lock (sync) working = HasOpenChild(row.IsStop ? t.StopOrders : t.TargetOrders);
                 if (!working)
                 {
                     string placed = PreviewProtective(t, row.IsStop, pick.Source, (row.BandBox.SelectedItem as BandPick).Plot);
-                    if (placed != null) return placed;
+                    if (placed != null && (EntryIsFilled(t) || !IsWaitingSide(placed))) return placed;
                 }
                 return null;
             }
@@ -6514,11 +7343,19 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (selected == null || string.IsNullOrEmpty(selectedKey))
                 return "Select an ATM strategy in Chart Trader to use a fixed stop or target.";
             bool live;
-            lock (sync) live = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
-            if (!live)
+            lock (sync) live = HasOpenChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+            if (!live && EntryIsFilled(t))
             {
                 string placed = PreviewAtmLeg(t, row.IsStop, selected);
                 if (placed != null) return placed;
+            }
+            if (!live && !EntryIsFilled(t))
+            {
+                double stopVal, targetVal;
+                CalculationMode mode;
+                string readError;
+                if (!TryReadBracket(selected, 0, out stopVal, out targetVal, out mode, out readError))
+                    return string.IsNullOrEmpty(readError) ? "Could not read the ATM template." : readError;
             }
             return null;
         }
@@ -6535,12 +7372,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 FollowPick a = row.EmaABox.SelectedItem as FollowPick;
                 FollowPick b = row.EmaBBox.SelectedItem as FollowPick;
+                int plotA = PlotOfCross(a, row.EmaABand);
+                int plotB = PlotOfCross(b, row.EmaBBand);
+                string nameA = NameOfCross(a, row.EmaABand);
+                string nameB = NameOfCross(b, row.EmaBBand);
                 lock (sync)
                 {
                     t.TargetSource = LegFollow.EmaCross;
                     t.TargetIndicator = null;
                     t.TargetEmaA = a.Source.Indicator;
                     t.TargetEmaB = b.Source.Indicator;
+                    t.TargetEmaAPlot = plotA;
+                    t.TargetEmaBPlot = plotB;
                     t.TargetEmaSign = 0;
                     t.TargetCrossSent = false;
                     t.TargetCrossPending = false;
@@ -6548,7 +7391,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     t.TargetMissing = false;
                     t.TargetMacdSet = false;
                 }
-                parts.Add("Target will close when " + a.Text + " crosses " + b.Text + ". The position stays open until then.");
+                parts.Add("Target will close when " + nameA + " crosses " + nameB + ". "
+                    + (EntryIsFilled(t) ? "The position stays open until then." : "The order stays working, and the close starts after it fills."));
                 return null;
             }
             if (IsMacdFollow(pick))
@@ -6574,42 +7418,80 @@ namespace NinjaTrader.NinjaScript.Indicators
                         : "crosses up through 0, from negative to positive")
                     : "absolute level falls through " + FormatMacd(magnitude);
                 parts.Add(which + " will close the " + (isLong ? "buy" : "sell")
-                    + " when MACD " + how + ". The other protective order is cancelled, then the position closes at the market.");
+                    + " when MACD " + how + ". The other protective order is cancelled, then the position closes at the market."
+                    + (EntryIsFilled(t) ? "" : " This starts after the order fills."));
                 return null;
             }
             if (pick.Kind == FollowKind.Atm)
             {
                 bool working;
-                lock (sync) working = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+                bool open;
+                lock (sync)
+                {
+                    working = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+                    open = HasOpenChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+                }
+                NinjaTrader.NinjaScript.AtmStrategy atm = SelectedAtm();
+                string key = atm == null ? null : AtmTemplateKey(atm);
+                if (atm == null || string.IsNullOrEmpty(key))
+                    return "Select an ATM strategy in Chart Trader to use a fixed stop or target.";
+                if (!EntryIsFilled(t))
+                {
+                    lock (sync) { AssignAtmLeg(t, row.IsStop, key, atm); }
+                    parts.Add(which + " will be placed from the ATM strategy when the order fills.");
+                    return null;
+                }
                 if (working)
                 {
-                    NinjaTrader.NinjaScript.AtmStrategy atm = SelectedAtm();
-                    string key = atm == null ? null : AtmTemplateKey(atm);
-                    if (atm == null || string.IsNullOrEmpty(key))
-                        return "Select an ATM strategy in Chart Trader to use a fixed stop or target.";
                     List<string> notes = new List<string>();
                     RepriceProtective(t, atm, notes, row.IsStop, !row.IsStop);
                     if (notes.Count > 0) return notes[0];
-                    lock (sync)
-                    {
-                        AssignAtmLeg(t, row.IsStop, key, atm);
-                    }
-                    parts.Add(which + " left on the ATM strategy.");
+                    lock (sync) { AssignAtmLeg(t, row.IsStop, key, atm); }
+                    parts.Add(which + " left on the ATM strategy"
+                        + (EntryIsFilled(t) ? "." : ". It follows this order until it fills."));
+                    return null;
+                }
+                if (open)
+                {
+                    lock (sync) { AssignAtmLeg(t, row.IsStop, key, atm); }
+                    parts.Add(which + " left on the ATM strategy"
+                        + (EntryIsFilled(t) ? "." : ". It follows this order until it fills."));
                     return null;
                 }
                 string error = PlaceAtmLeg(t, row.IsStop);
+                if (error != null && !EntryIsFilled(t) && IsWaitingSide(error))
+                {
+                    lock (sync) { AssignAtmLeg(t, row.IsStop, key, atm); }
+                    parts.Add(which + " will use the ATM strategy when its price can rest. It follows this order until it fills.");
+                    return null;
+                }
                 if (error != null) return error;
-                parts.Add(which + " placed from the ATM strategy.");
+                parts.Add(which + " placed from the ATM strategy"
+                    + (EntryIsFilled(t) ? "." : ". It follows this order until it fills."));
                 return null;
             }
 
             BandPick band = row.BandBox.SelectedItem as BandPick;
             if (band == null || pick.Source == null) return "Choose a band for " + pick.Text + ".";
             bool live;
-            lock (sync) live = HasWorkingChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+            lock (sync) live = HasOpenChild(row.IsStop ? t.StopOrders : t.TargetOrders);
+            bool filled = EntryIsFilled(t);
+            string bandName = row.BandBox.Visibility == Visibility.Visible ? (" " + band.Text) : "";
+            if (!filled)
+            {
+                lock (sync) { AssignIndicatorLeg(t, row.IsStop, pick.Source.Indicator, band.Plot); }
+                parts.Add(which + " will be placed on " + pick.Text + bandName + " when the order fills.");
+                return null;
+            }
             if (!live)
             {
                 string error = PlaceIndicatorLeg(t, row.IsStop, pick.Source, band.Plot);
+                if (error != null && !filled && IsWaitingSide(error))
+                {
+                    lock (sync) { AssignIndicatorLeg(t, row.IsStop, pick.Source.Indicator, band.Plot); }
+                    parts.Add(which + " will follow " + pick.Text + bandName + " when its price can rest. The order stays working.");
+                    return null;
+                }
                 if (error != null) return error;
             }
             lock (sync) { AssignIndicatorLeg(t, row.IsStop, pick.Source.Indicator, band.Plot); }
@@ -6618,16 +7500,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 string note = FollowLeg(t, row.IsStop, CurrentBar);
                 if (!string.IsNullOrEmpty(note)) parts.Add(note);
                 else
-                {
-                    string bandName = row.BandBox.Visibility == Visibility.Visible ? (" " + band.Text) : "";
                     parts.Add(which + " follows " + pick.Text + bandName + ".");
-                }
             }
             else
-            {
-                string bandName = row.BandBox.Visibility == Visibility.Visible ? (" " + band.Text) : "";
-                parts.Add(which + " placed on " + pick.Text + bandName + ".");
-            }
+                parts.Add(which + " placed on " + pick.Text + bandName
+                    + (filled ? "." : ". It follows this order until it fills."));
             return null;
         }
 
@@ -6810,11 +7687,19 @@ namespace NinjaTrader.NinjaScript.Indicators
             error = null;
             lock (sync)
             {
-                fill = t.FillPrice > 0 ? t.FillPrice : (t.Order != null ? t.Order.AverageFillPrice : 0);
-                qty = OpenQuantity(t);
+                fill = EntryAnchor(t);
+                qty = ProtectiveQty(t);
             }
-            if (fill <= 0) { error = "That order has no fill price yet."; return false; }
-            if (qty <= 0) { error = "That order has no quantity left open."; return false; }
+            if (fill <= 0)
+            {
+                error = EntryIsFilled(t) ? "That order has no fill price yet." : "That order has no price yet.";
+                return false;
+            }
+            if (qty <= 0)
+            {
+                error = EntryIsFilled(t) ? "That order has no quantity left open." : "That order has no quantity.";
+                return false;
+            }
             double stopVal, targetVal;
             CalculationMode mode;
             if (!TryReadBracket(atm, 0, out stopVal, out targetVal, out mode, out error))
@@ -6870,8 +7755,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return false;
             }
             price = Instrument.MasterInstrument.RoundToTickSize(raw);
-            lock (sync) qty = OpenQuantity(t);
-            if (qty <= 0) { error = "That order has no quantity left open."; return false; }
+            lock (sync) qty = ProtectiveQty(t);
+            if (qty <= 0)
+            {
+                error = EntryIsFilled(t) ? "That order has no quantity left open." : "That order has no quantity.";
+                return false;
+            }
             return SideError(t, isStop, price, out error);
         }
 
@@ -6949,6 +7838,23 @@ namespace NinjaTrader.NinjaScript.Indicators
             return "Could not cancel the " + (stops ? "stop" : "target") + ".";
         }
 
+        // Brackets this tool placed on an entry that is being cancelled or replaced.
+        private void CancelTrackedLegs(TrackedOrder t)
+        {
+            if (t == null || t.Account == null) return;
+            List<Order> orders = new List<Order>();
+            lock (sync)
+            {
+                foreach (Order o in t.StopOrders)
+                    if (o != null && IsChangeable(o) && !ContainsOrder(orders, o)) orders.Add(o);
+                foreach (Order o in t.TargetOrders)
+                    if (o != null && IsChangeable(o) && !ContainsOrder(orders, o)) orders.Add(o);
+            }
+            if (orders.Count == 0) return;
+            try { t.Account.Cancel(orders.ToArray()); }
+            catch (Exception ex) { Print("KcMidTrader leg cancel error: " + ex.Message); }
+        }
+
         private void AttachWorkingLegs(TrackedOrder t, bool stops)
         {
             if (t == null || t.Account == null) return;
@@ -6979,7 +7885,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool BelongsToEntryLeg(TrackedOrder t, Order o, bool stops, NinjaTrader.NinjaScript.StrategyBase owner)
         {
             if (o == null || t == null || owner == null || o == t.Order || !IsChangeable(o)) return false;
-            if (o.Instrument == null || Instrument == null || o.Instrument.FullName != Instrument.FullName) return false;
+            if (o.Instrument == null || !SameInstrument(o.Instrument)) return false;
             string name = o.Name ?? "";
             if (stops)
             {
@@ -7004,24 +7910,63 @@ namespace NinjaTrader.NinjaScript.Indicators
             return false;
         }
 
+        private readonly object placeGate = new object();
+
+        // Open size of this chart instrument on the account, in the direction of the entry. 0 when flat
+        // or on the other side. If the position cannot be read, the caller's own quantity is trusted.
+        private int LivePositionQty(Account acct, bool isLong)
+        {
+            if (acct == null) return 0;
+            try
+            {
+                Position[] all;
+                lock (acct.Positions) all = acct.Positions.ToArray();
+                foreach (Position p in all)
+                {
+                    if (p == null || p.Instrument == null || !SameInstrument(p.Instrument)) continue;
+                    if (p.MarketPosition == MarketPosition.Flat) return 0;
+                    if ((p.MarketPosition == MarketPosition.Long) != isLong) return 0;
+                    return p.Quantity;
+                }
+                return 0;
+            }
+            catch { return int.MaxValue; }
+        }
+
         private string PlaceProtective(TrackedOrder t, bool isStop, double price, int qty)
         {
             if (t == null || t.Account == null || qty <= 0 || price <= 0)
                 return "Could not place the protective order.";
+            if (!EntryIsFilled(t))
+                return (isStop ? "Stop" : "Target") + " waits for the order to fill.";
             bool isLong = IsBuyAction(t.Action);
+            // A protective order must only reduce a position. When the account is flat, or already on
+            // the other side, a stop or target would open a new BUY / SELL order instead.
+            int livePos = LivePositionQty(t.Account, isLong);
+            if (livePos <= 0)
+                return (isStop ? "Stop" : "Target") + " was not placed: there is no open position to protect.";
+            if (qty > livePos) qty = livePos;
             OrderAction action = isLong ? OrderAction.Sell : OrderAction.BuyToCover;
             OrderType type = isStop ? OrderType.StopMarket : OrderType.Limit;
             double lmt = type == OrderType.Limit ? price : 0;
             double stp = type == OrderType.StopMarket ? price : 0;
             try
             {
-                Order o = t.Account.CreateOrder(Instrument, action, type, OrderEntry.Manual, OrderTif, qty,
-                    lmt, stp, string.Empty, isStop ? "Stop1" : "Target1", NinjaTrader.Core.Globals.MaxDate, null);
-                t.Account.Submit(new[] { o });
-                lock (sync)
+                // One placement at a time, and never beside a leg that is already resting.
+                lock (placeGate)
                 {
-                    if (isStop) t.StopOrders.Add(o);
-                    else t.TargetOrders.Add(o);
+                    lock (sync)
+                    {
+                        if (HasOpenChild(isStop ? t.StopOrders : t.TargetOrders)) return null;
+                    }
+                    Order o = t.Account.CreateOrder(Instrument, action, type, OrderEntry.Manual, OrderTif, qty,
+                        lmt, stp, string.Empty, isStop ? "Stop1" : "Target1", NinjaTrader.Core.Globals.MaxDate, null);
+                    lock (sync)
+                    {
+                        if (isStop) t.StopOrders.Add(o);
+                        else t.TargetOrders.Add(o);
+                    }
+                    t.Account.Submit(new[] { o });
                 }
                 HookAccount(t.Account);
                 return null;
@@ -7169,7 +8114,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 t.EntryMacdBar = bar;
                 t.EntryPriceInd = price.Indicator;
                 t.EntryPricePlot = plot;
+                t.LinePlot = plot;
+                t.LinePlotSet = true;
+                t.LineInd = price.Indicator;
                 t.StopSource = LegFollow.Atm;
+                t.TargetSource = LegFollow.Atm;
+                RememberArmAtm(t);
                 tracked.Add(t);
             }
 
@@ -7231,6 +8181,30 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
+        // An armed order keeps the ATM it was given. A later Chart Trader change updates it only when that order is checked.
+        private void RememberArmAtm(TrackedOrder t)
+        {
+            if (t == null) return;
+            string key = UseChartTraderAtm ? (liveAtmKey ?? "") : "";
+            t.AtmName = key;
+            t.AtmTemplate = key.Length > 0 ? liveAtm : null;
+            t.FollowAtm = key.Length > 0;
+        }
+
+        private void AtmChosenFor(TrackedOrder t, out string chosenAtm, out NinjaTrader.NinjaScript.AtmStrategy atm)
+        {
+            chosenAtm = "";
+            atm = null;
+            if (t != null && t.AtmName != null)
+                chosenAtm = t.AtmName;
+            else if (UseChartTraderAtm)
+                chosenAtm = liveAtmKey ?? "";
+            if (chosenAtm.Length == 0) return;
+            atm = t == null ? null : t.AtmTemplate;
+            if (atm == null && string.Equals(liveAtmKey, chosenAtm, StringComparison.OrdinalIgnoreCase))
+                atm = liveAtm;
+        }
+
         private string SubmitArmedMacd(TrackedOrder t, int bar, int sign, out string waitReason)
         {
             waitReason = null;
@@ -7242,14 +8216,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                 priceBar = CurrentBar - 1;
             if (priceBar < 0) priceBar = bar;
 
-            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase priceInd = t.EntryPriceInd;
-            int pricePlot = t.EntryPricePlot;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase priceInd = t.LineInd ?? t.EntryPriceInd;
+            int pricePlot = t.LinePlotSet ? t.LinePlot : t.EntryPricePlot;
             KcSource livePrice = keltnerPrice;
             if (livePrice != null && livePrice.Indicator != null
                 && (priceInd == null || ReferenceEquals(livePrice.Indicator, priceInd)))
             {
                 priceInd = livePrice.Indicator;
-                pricePlot = ActivePlot(livePrice);
+                if (!t.LinePlotSet)
+                    pricePlot = ActivePlot(livePrice);
             }
 
             double raw;
@@ -7283,13 +8258,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             double lmt = price;
             double stp = 0;
 
-            string chosenAtm = "";
-            NinjaTrader.NinjaScript.AtmStrategy atm = null;
-            if (UseChartTraderAtm)
-            {
-                chosenAtm = liveAtmKey ?? "";
-                atm = chosenAtm.Length > 0 ? liveAtm : null;
-            }
+            string chosenAtm;
+            NinjaTrader.NinjaScript.AtmStrategy atm;
+            AtmChosenFor(t, out chosenAtm, out atm);
 
             OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
             string orderName = chosenAtm.Length > 0 ? "Entry" : OrderNamePrefix + (isBuy ? "Buy" : "Sell");
@@ -7313,8 +8284,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 t.AtmTemplate = atm;
                 t.AtmName = chosenAtm;
                 t.FollowAtm = chosenAtm.Length > 0;
-                t.StopSource = LegFollow.Atm;
-                t.TargetSource = LegFollow.Atm;
+                if (!t.BracketSet)
+                {
+                    t.StopSource = LegFollow.Atm;
+                    t.TargetSource = LegFollow.Atm;
+                }
             }
 
             try
@@ -7362,9 +8336,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 t.Label, isBuy ? "BUY" : "SELL", t.Quantity,
                 Instrument.MasterInstrument.FormatPrice(price), FormatMacd(t.EntryMacdLevel));
             if (t.Track) msg += " (tracking the Keltner line)";
-            msg += chosenAtm.Length == 0
-                ? ". No ATM strategy was selected."
-                : ". Stop and target stay on the ATM.";
+            if (t.BracketSet)
+                msg += ". Stop and target stay on the SL / TP choices.";
+            else if (chosenAtm.Length == 0)
+                msg += ". No ATM strategy was selected.";
+            else
+                msg += ". Stop and target stay on the ATM.";
             return msg;
         }
 
@@ -7488,9 +8465,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 SetStatusNow("Configure EMA cross before using it.");
                 return;
             }
-            if (emaOnChart < 2)
+            if (crossChoices < 2)
             {
-                SetStatusNow("EMA cross needs two EMAs.");
+                SetStatusNow("EMA cross needs two EMAs, or an EMA and a Keltner.");
                 return;
             }
             Account acct = SelectedAccount();
@@ -7499,7 +8476,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             RememberAtm();
             int bar = CurrentBar - 1;
             int sign;
-            if (bar < 0 || !TryEmaSign(crossEmaA, crossEmaB, bar, out sign))
+            if (bar < 0 || !TryEmaSign(crossEmaA, crossEmaAPlot, crossEmaB, crossEmaBPlot, bar, out sign))
             {
                 SetStatusNow("EMA cross has no value yet.");
                 return;
@@ -7522,7 +8499,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 t.EntryCrossBar = -1;
                 t.TargetEmaA = crossEmaA;
                 t.TargetEmaB = crossEmaB;
+                t.TargetEmaAPlot = crossEmaAPlot;
+                t.TargetEmaBPlot = crossEmaBPlot;
                 t.StopSource = LegFollow.Atm;
+                t.TargetSource = LegFollow.EmaCross;
+                t.TargetEmaSign = sign;
+                RememberArmAtm(t);
                 tracked.Add(t);
             }
 
@@ -7532,13 +8514,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             SetStatusNow((isBuy ? "Buy" : "Sell") + " armed. Waiting for " + wait + ".");
         }
 
-        private bool TryEmaSign(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase a,
-                                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase b, int bar, out int sign)
+        private bool TryEmaSign(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase a, int plotA,
+                                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase b, int plotB, int bar, out int sign)
         {
             sign = 0;
             double va, vb;
             if (a == null || b == null || bar < 0) return false;
-            if (!TryReadSeries(a, 0, bar, out va) || !TryReadSeries(b, 0, bar, out vb)) return false;
+            if (!TryReadSeries(a, plotA, bar, out va) || !TryReadSeries(b, plotB, bar, out vb)) return false;
             sign = va.ApproxCompare(vb);
             return true;
         }
@@ -7563,14 +8545,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void ReleaseEmaCrossArms(int bar)
         {
-            if (emaOnChart < 2)
+            if (!crossPairOnChart)
             {
                 bool waiting;
                 lock (sync) waiting = tracked.Any(x => x.WaitCross && x.Order == null);
                 if (waiting && !crossPausedNoted)
                 {
                     crossPausedNoted = true;
-                    SetStatus("EMA cross paused: an EMA was removed.");
+                    SetStatus("EMA cross paused: a chosen line was removed.");
                 }
                 return;
             }
@@ -7581,12 +8563,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             foreach (TrackedOrder t in arms)
             {
                 int sign;
-                if (!TryEmaSign(t.TargetEmaA, t.TargetEmaB, bar, out sign))
+                if (!TryEmaSign(t.TargetEmaA, t.TargetEmaAPlot, t.TargetEmaB, t.TargetEmaBPlot, bar, out sign))
                 {
                     if (!t.ArmNoted)
                     {
                         t.ArmNoted = true;
-                        SetStatus("EMA cross paused: an EMA has no value.");
+                        SetStatus("EMA cross paused: a line has no value.");
                     }
                     continue;
                 }
@@ -7607,13 +8589,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (t == null || t.Account == null || t.Quantity <= 0) return "Could not place the EMA cross entry.";
             bool isBuy = IsBuyAction(t.Action);
-            string chosenAtm = "";
-            NinjaTrader.NinjaScript.AtmStrategy atm = null;
-            if (UseChartTraderAtm)
-            {
-                chosenAtm = liveAtmKey ?? "";
-                atm = chosenAtm.Length > 0 ? liveAtm : null;
-            }
+            string chosenAtm;
+            NinjaTrader.NinjaScript.AtmStrategy atm;
+            AtmChosenFor(t, out chosenAtm, out atm);
 
             OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
             string orderName = chosenAtm.Length > 0 ? "Entry" : OrderNamePrefix + (isBuy ? "Buy" : "Sell");
@@ -7638,15 +8616,20 @@ namespace NinjaTrader.NinjaScript.Indicators
                 t.AtmTemplate = atm;
                 t.AtmName = chosenAtm;
                 t.FollowAtm = chosenAtm.Length > 0;
-                t.StopSource = LegFollow.Atm;
-                t.TargetSource = LegFollow.EmaCross;
-                t.TargetIndicator = null;
-                t.TargetEmaSign = sign;
                 t.EntryCrossBar = bar;
-                t.TargetCrossSent = false;
-                t.TargetCrossPending = false;
-                t.TargetPaused = false;
-                t.TargetMissing = false;
+                if (!t.BracketSet)
+                {
+                    t.StopSource = LegFollow.Atm;
+                    t.TargetSource = LegFollow.EmaCross;
+                    t.TargetIndicator = null;
+                    t.TargetEmaSign = sign;
+                    t.TargetCrossSent = false;
+                    t.TargetCrossPending = false;
+                    t.TargetPaused = false;
+                    t.TargetMissing = false;
+                }
+                else if (t.TargetSource == LegFollow.EmaCross)
+                    t.TargetEmaSign = sign;
             }
 
             try
@@ -7692,7 +8675,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             string msg = string.Format("{0}  {1} {2} MKT on EMA cross",
                 t.Label, isBuy ? "BUY" : "SELL", t.Quantity);
-            if (chosenAtm.Length == 0)
+            if (t.BracketSet)
+                msg += ". Stop and target stay on the SL / TP choices.";
+            else if (chosenAtm.Length == 0)
                 msg += ". Stop was not placed.";
             else
                 msg += ". Stop stays on the ATM. Target waits for the next EMA cross.";
@@ -7703,18 +8688,21 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (t == null) return null;
             NinjaTrader.Gui.NinjaScript.IndicatorRenderBase a, b;
+            int plotA, plotB;
             lock (sync)
             {
                 if (t.TargetSource != LegFollow.EmaCross || t.TargetCrossSent || t.TargetCrossPending) return null;
                 if (t.EntryCrossBar >= 0 && barIndex <= t.EntryCrossBar) return null;
                 a = t.TargetEmaA;
                 b = t.TargetEmaB;
+                plotA = t.TargetEmaAPlot;
+                plotB = t.TargetEmaBPlot;
             }
             double va, vb;
-            if (a == null || b == null || !TryReadSeries(a, 0, barIndex, out va) || !TryReadSeries(b, 0, barIndex, out vb))
+            if (a == null || b == null || !TryReadSeries(a, plotA, barIndex, out va) || !TryReadSeries(b, plotB, barIndex, out vb))
             {
                 if (NoteLegFlag(t, false, false))
-                    return "EMA cross paused: an EMA has no value.";
+                    return "EMA cross paused: a line has no value.";
                 return null;
             }
             int sign = va.ApproxCompare(vb);
@@ -7818,6 +8806,143 @@ namespace NinjaTrader.NinjaScript.Indicators
             return n;
         }
 
+        private void ScheduleStoredBrackets(TrackedOrder t)
+        {
+            if (t == null) return;
+            if (ChartControl == null)
+            {
+                FinishStoredBrackets(t);
+                return;
+            }
+            ChartControl.Dispatcher.InvokeAsync(delegate { FinishStoredBrackets(t); });
+        }
+
+        // A choice made on a working order. Once it fills, keep that stop and target on the fill
+        // even when the ATM also submits its own copy.
+        private void FinishStoredBrackets(TrackedOrder t)
+        {
+            if (t == null || !t.BracketSet || t.Completed || !EntryIsFilled(t)) return;
+            try
+            {
+                AttachWorkingLegs(t, true);
+                AttachWorkingLegs(t, false);
+                if (RejectsChild(t, true)) CancelWorkingLegs(t, true);
+                if (RejectsChild(t, false)) CancelWorkingLegs(t, false);
+                string stopError = PlaceOrShapeLeg(t, true);
+                string targetError = PlaceOrShapeLeg(t, false);
+                if (stopError != null && !IsWaitingSide(stopError)) SetStatus(stopError);
+                else if (targetError != null && !IsWaitingSide(targetError)) SetStatus(targetError);
+                lock (sync) t.BracketAnchor = EntryAnchor(t);
+            }
+            catch (Exception ex) { Print("KcMidTrader SL/TP fill error: " + ex.Message); }
+        }
+
+        private static bool InAtmGrace(TrackedOrder t)
+        {
+            return t != null && t.AtmGraceUntil > DateTime.UtcNow;
+        }
+
+        private string PlaceOrShapeLeg(TrackedOrder t, bool isStop)
+        {
+            LegFollow source;
+            bool open;
+            bool working;
+            lock (sync)
+            {
+                source = isStop ? t.StopSource : t.TargetSource;
+                List<Order> orders = isStop ? t.StopOrders : t.TargetOrders;
+                open = HasOpenChild(orders);
+                working = HasWorkingChild(orders);
+            }
+            if (source == LegFollow.Indicator)
+            {
+                if (working) return FollowLeg(t, isStop, CurrentBar);
+                if (open || InAtmGrace(t)) return null;
+                return PlaceStoredIndicator(t, isStop);
+            }
+            if (source == LegFollow.Atm)
+            {
+                if (working)
+                {
+                    NinjaTrader.NinjaScript.AtmStrategy atm = TemplateOf(t);
+                    if (atm == null) return null;
+                    List<string> notes = new List<string>();
+                    RepriceProtective(t, atm, notes, isStop, !isStop);
+                    return notes.Count > 0 ? notes[0] : null;
+                }
+                if (open || InAtmGrace(t)) return null;
+                return PlaceStoredAtmLeg(t, isStop);
+            }
+            return null;
+        }
+
+        private string PlaceStoredAtmLeg(TrackedOrder t, bool isStop)
+        {
+            NinjaTrader.NinjaScript.AtmStrategy atm = TemplateOf(t);
+            string key;
+            lock (sync) key = t == null || t.AtmName == null ? "" : t.AtmName;
+            if (atm == null || key.Length == 0) return null;
+            double fill, price;
+            int qty;
+            string error;
+            if (!TryAtmProtectivePrice(t, isStop, atm, out fill, out qty, out price, out error))
+                return error;
+            error = PlaceProtective(t, isStop, price, qty);
+            if (error != null) return error;
+            lock (sync) { AssignAtmLeg(t, isStop, key, atm); }
+            return null;
+        }
+
+        private string PlaceStoredIndicator(TrackedOrder t, bool isStop)
+        {
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind;
+            int plot;
+            int qty;
+            lock (sync)
+            {
+                ind = isStop ? t.StopIndicator : t.TargetIndicator;
+                plot = isStop ? t.StopPlot : t.TargetPlot;
+                qty = ProtectiveQty(t);
+            }
+            string which = isStop ? "Stop" : "Target";
+            double raw;
+            if (ind == null || !TryReadSeries(ind, plot, CurrentBar, out raw))
+                return which + " was not placed: its indicator has no value.";
+            double price = Instrument.MasterInstrument.RoundToTickSize(raw);
+            if (qty <= 0)
+                return EntryIsFilled(t) ? "That order has no quantity left open." : "That order has no quantity.";
+            string error;
+            if (!SideError(t, isStop, price, out error)) return error;
+            return PlaceProtective(t, isStop, price, qty);
+        }
+
+        private static bool EntryIsFilled(TrackedOrder t)
+        {
+            return t != null && t.Order != null && t.Order.Filled > 0;
+        }
+
+        private static double EntryAnchor(TrackedOrder t)
+        {
+            if (t == null) return 0;
+            if (t.FillPrice > 0) return t.FillPrice;
+            if (t.Order != null && t.Order.AverageFillPrice > 0) return t.Order.AverageFillPrice;
+            if (t.Order == null) return 0;
+            if (t.Order.OrderType == OrderType.Limit && t.Order.LimitPrice > 0) return t.Order.LimitPrice;
+            if (t.Order.StopPrice > 0) return t.Order.StopPrice;
+            if (t.Order.LimitPrice > 0) return t.Order.LimitPrice;
+            return 0;
+        }
+
+        private static int ProtectiveQty(TrackedOrder t)
+        {
+            int open = OpenQuantity(t);
+            if (open > 0) return open;
+            if (t == null || (t.Order != null && t.Order.Filled > 0)) return 0;
+            int qty = t.Quantity > 0 ? t.Quantity : (t.Order != null ? t.Order.Quantity : 0);
+            if (t.Order != null) qty -= t.Order.Filled;
+            return qty > 0 ? qty : 0;
+        }
+
         private static int OpenQuantity(TrackedOrder t)
         {
             if (t == null || t.Order == null) return 0;
@@ -7863,3 +8988,60 @@ namespace NinjaTrader.NinjaScript.Indicators
         public int MaxTicksOffset { get; set; }
     }
 }
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private KcMidTrader[] cacheKcMidTrader;
+		public KcMidTrader KcMidTrader()
+		{
+			return KcMidTrader(Input);
+		}
+
+		public KcMidTrader KcMidTrader(ISeries<double> input)
+		{
+			if (cacheKcMidTrader != null)
+				for (int idx = 0; idx < cacheKcMidTrader.Length; idx++)
+					if (cacheKcMidTrader[idx] != null &&  cacheKcMidTrader[idx].EqualsInput(input))
+						return cacheKcMidTrader[idx];
+			return CacheIndicator<KcMidTrader>(new KcMidTrader(), input, ref cacheKcMidTrader);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.KcMidTrader KcMidTrader()
+		{
+			return indicator.KcMidTrader(Input);
+		}
+
+		public Indicators.KcMidTrader KcMidTrader(ISeries<double> input )
+		{
+			return indicator.KcMidTrader(input);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.KcMidTrader KcMidTrader()
+		{
+			return indicator.KcMidTrader(Input);
+		}
+
+		public Indicators.KcMidTrader KcMidTrader(ISeries<double> input )
+		{
+			return indicator.KcMidTrader(input);
+		}
+	}
+}
+
+#endregion
