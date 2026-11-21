@@ -20,13 +20,13 @@
 **KC Mid Trader** is a NinjaTrader 8 indicator that adds a **KC MIDBAND** section to the bottom of **Chart Trader**. From there you can send Buy or Sell orders **attached to the midband of a Keltner Channel** (optionally a few ticks away from it) with one click, keep them following the line as it moves, and cancel them, without touching any of your other orders.
 
 Main features:
-- **Buy @ Midline / Sell @ Midline**: the order is placed at the selected line plus a tick offset, rounded to the tick.
-- **Tick offset**: *Offset* (− / box / +) puts the buy *n* ticks **above** the line and the sell *n* ticks **below** it; 0 keeps the line price. **Show zone** draws it on the chart (light blue above, light red below).
+- **Buy @ Midline / Sell @ Midline**: the order is placed at the selected line plus a signed tick offset, rounded to the tick.
+- **Tick offset**: *Offset* (− / box / +) is signed, from −100.00 to 100.00 in steps of 0.05 (buttons, arrow keys, wheel). Positive puts the buy *n* ticks **above** the line and the sell *n* ticks **below** it; negative flips that; 0 keeps the line price. **Show zone** draws it on the chart (light blue above, light red below).
 - **Track + Line selectors**: *Track* picks the indicator (the first Keltner by default, locked until **Toggle track** is checked, which opens it to any indicator); *Line* picks the plot to follow (Midline by default, or Upper / Lower).
-- **Attached orders**: working orders are re-priced each time the line (plus offset) moves.
-- **EMA-cross and MACD triggers**: *Track* can also hold **EMA cross** (needs two EMAs) or a **MACD**. The Buy or Sell stays *not filled* until the cross, then goes in at the Keltner line (see [Advanced](#advanced-sl--tp-ema-cross-and-macd)).
+- **Attached orders**: each working order keeps **its own line** and is re-priced each time that line (plus offset) moves. Changing *Track* or *Line* moves only the checked not-filled orders that have no SL / TP.
+- **EMA-cross and MACD triggers**: *Track* can also hold **EMA cross** (two EMAs, or an EMA and a Keltner line) or a **MACD**. The Buy or Sell stays *not filled* until the cross, then goes in at the Keltner line (see [Advanced](#advanced-sl--tp-ema-cross-and-macd)).
 - **Three order lists**: **Not filled**, **Filled** and **Completed** (W / L with points). Chart Trader *Mkt / Bid / Ask* orders are listed too.
-- **SL / TP**: on one checked filled order, keep the ATM, remove a leg, make it follow an indicator, close the target on an EMA cross, or close on a MACD level.
+- **SL / TP**: on one checked order, filled or still working (several checked not-filled orders can be set together), keep the ATM, remove a leg, make it follow an indicator, close the target on an EMA cross, or close on a MACD level.
 - **Own quantity**: a Qty box with ▲▼ arrows, set to 1 by default and independent of Chart Trader's *Order qty*.
 - **ATM-aware**: changing the ATM strategy cancels and re-submits unfilled entries with the new template, and re-prices the stop/target of the filled orders you check.
 - **Cancel KC Orders**: cancels only the orders this tool placed.
@@ -131,14 +131,14 @@ The order type depends on which side of the market the order price (line ± offs
 | Order price on the other side of the market | **Block** (default) or **Buy Stop Market** | **Block** (default) or **Sell Stop Market** |
 | Order price exactly at the market | Not placed | Not placed |
 
-**Offset:** a signed number of ticks from **-100.00** to **100.00** (two decimal places). The buy price is `line + n ticks` and the sell price is `line − n ticks` (rounded to the tick). Positive `n` puts buys above the line and sells below it; negative `n` flips that. *Max ticks offset* (default 100) only trims the magnitude of a typed value; it is never added to the line.
+**Offset:** the buy price is `line + n ticks`, the sell price is `line − n ticks` (rounded to the tick). *Max ticks offset* (default 100) only trims a typed value in the Offset box; it is never added to the line.
 
 **Order lists:** each order gets a label like `Ord-af3658-Nov-10-26_09-31-02-114-BUY-1-NF`. Orders sit in one of three lists:
 
 | List | Meaning |
 |---|---|
-| **Not filled** (`NF`) | Working or armed orders. Unfilled entries are cancelled and re-submitted when the ATM strategy changes |
-| **Filled** (`F`) | Open fills, with a checkbox. Checked ones have their ATM stop/target re-priced on an ATM change; check **one** to enable **SL / TP** |
+| **Not filled** (`NF`) | Working or armed orders, including Chart Trader *Mkt / Bid / Ask*. Check one to set its stop or target, or several to set them together. Unfilled entries are cancelled and re-submitted when the ATM strategy changes |
+| **Filled** (`F`) | Open fills (Chart Trader *Mkt / Bid / Ask* too, with the ATM keeping its stop and target), with a checkbox. Checked ones have their ATM stop/target re-priced on an ATM change; check **one** to enable **SL / TP** |
 | **Completed** | Closed trades such as `…-F-W-5.25` or `…-F-L-4.75`. `W` = win, `L` = loss, the last number is points (4 ticks = 1 point) |
 
 </details>
@@ -170,13 +170,13 @@ The order type depends on which side of the market the order price (line ± offs
 | # | Action | Result |
 |---|---|---|
 | 1 | Select the account (and the ATM, if wanted) in Chart Trader | KC orders use them; Chart Trader's *Order qty* is **not** used |
-| 2 | Pick the indicator in **Track** and the plot in **Line** | Only needed with several Keltner indicators or to follow Upper / Lower. *Track* is locked until **Toggle track** is checked |
+| 2 | Pick the indicator in **Track** and the plot in **Line** | Only needed with several Keltner indicators or to follow Upper / Lower. *Track* is locked until **Toggle track** is checked. Changing either moves only the checked not-filled orders without SL / TP |
 | 3 | Set **Qty** with ▲▼, the mouse wheel or by typing | Starts at *Default quantity* (1) |
-| 4 | Set **Offset** with − / +, typing or the wheel | Buy *n* ticks above the line, sell *n* ticks below; 0 = on the line. **Show zone** draws it |
+| 4 | Set **Offset** with − / +, typing, arrow keys or the wheel | Signed ticks (−100.00 to 100.00, step 0.05): buy above the line, sell below; negative flips that; 0 = on the line. **Show zone** draws it |
 | 5 | Use **Track line** and **Show zone** to save space | Unchecking *Track line* hides the Track and Line rows; unchecking *Show zone* hides the Offset row. Orders keep following the line and the offset keeps applying either way |
 | 6 | Click **Buy @ Midline** or **Sell @ Midline** | The order goes in at line ± offset; the status line confirms it and the order shows in *Not filled* as `…-NF` |
 | 7 | Click **Cancel KC Orders** | Cancels the tool's working orders only |
-| 8 | Check **one** filled order, then click **SL / TP** | Opens the stop-and-target window (see below). Closed trades move to *Completed* |
+| 8 | Check **one** order (filled or working), then click **SL / TP** | Opens the stop-and-target window (see below). Closed trades move to *Completed* |
 
 > **Cancel vs. Close:** *Cancel KC Orders* only removes orders that have not filled. Once filled (F), manage the position with Chart Trader's native **Close** button or your ATM stops/targets.
 
@@ -191,7 +191,7 @@ The order type depends on which side of the market the order price (line ± offs
 | When midband crosses market | `Block` | `Block` pauses / refuses; `SwitchToStopMarket` cancels, then re-submits as a stop (never doubled) |
 | Time in force | `GTC` | TIF for KC orders |
 | Use Chart Trader ATM strategy | `On` | KC entries launch the ATM selected in Chart Trader |
-| Max ticks offset | `100` | Magnitude ceiling for the Offset box (values from -100.00 to 100.00). A larger magnitude is trimmed to this setting |
+| Max ticks offset | `100` | Magnitude ceiling for the Offset box (−100.00 to 100.00); a typed value above it is trimmed to it |
 | Re-adopt working KC orders on reload | `On` | Picks up non-ATM orders named `KCMid…` again after a reload |
 
 The full step-by-step guide, with screenshots and troubleshooting, is in the manuals:
@@ -208,21 +208,21 @@ The full step-by-step guide, with screenshots and troubleshooting, is in the man
 <details open>
 <summary> <b>Advanced: SL / TP, EMA cross and MACD<b></summary>
 
-**SL / TP window** (check exactly one filled order, then click **SL / TP**). Each leg, stop and target, has its own source:
+**SL / TP window** (check one order, filled or working, then click **SL / TP**). Each leg, stop and target, has its own source. A working order gets its stop/target at once and they follow its price until it fills; confirming **locks** the bracket until you confirm again:
 
 | Leg source | Effect |
 |---|---|
 | ATM strategy | Leave the leg on the ATM template |
-| None | Remove the stop or the target. **The position stays open** |
+| None | Remove the stop or the target. **The position stays open** (on a working order the choice waits for the fill) |
 | Indicator + plot | The leg follows that plot (pick the band in the second list) |
 | EMA cross *(target only)* | Needs two EMAs. The target closes the position when EMA A crosses EMA B |
-| MACD + **Value** | Closes the position when the absolute MACD level falls through the value. At 0: a buy closes when MACD crosses down through 0, a sell when it crosses up |
+| MACD + **Value** | Magnitude (default 0, a minus sign is ignored). Closes the position when the absolute MACD level falls through it. At 0: a buy closes when MACD crosses down through 0, a sell when it crosses up |
 
 **Triggers chosen in Track:**
 
 | Track entry | How it works |
 |---|---|
-| **EMA cross** | Needs two EMAs; a window asks for EMA A and EMA B. Buy stays *not filled* until A crosses **above** B, Sell until A crosses **below** B. Then the entry goes in, the ATM stop is kept and the target waits for the next cross. *Line* shows `Cross` |
+| **EMA cross** | Needs two EMAs, or an EMA and a Keltner; a window asks for EMA A and EMA B (EMA(9) and EMA(20) when present, and either can be a Keltner on Midline, Upper or Lower). Buy stays *not filled* until A crosses **above** B, Sell until A crosses **below** B. Then the entry goes in, the ATM stop is kept and the target waits for the next cross. *Line* shows `Cross` |
 | **MACD** | A window asks for a magnitude. The order price stays the Keltner line chosen in *Line*; MACD is only the trigger. Buy waits for MACD to cross **above** the value, Sell for a cross **below**; then a limit is sent at the Keltner line and the ATM starts |
 
 > EMA and MACD crosses use the **closed bar** only. A cross that is **already true** does not open or close anything; it must leave and cross again.
@@ -274,7 +274,8 @@ The animated demo above is an illustration made with synthetic bars; the YouTube
 | "Waiting for real-time data…" | The connection is not live yet or the market is closed; use the Sim or Playback connection |
 | "Blocked: order price … the market" | A limit there would fill immediately (line plus offset is on the wrong side). Wait, lower the offset, or set *When midband crosses market* to `SwitchToStopMarket` |
 | The Track list is greyed out or missing | Greyed: locked on the Keltner indicator by design; check **Toggle track** to pick another. Missing: *Track line* is unchecked, which hides the Track and Line rows (*Show zone* hides the Offset row) |
-| The Offset box trims my number | Values outside -100.00 to 100.00 are trimmed, and so is a magnitude above *Max ticks offset* |
+| The Offset box trims my number | A value whose magnitude is above *Max ticks offset* (100) is trimmed; raise the setting |
+| My Track / Line / EMA / MACD choices come back after a reload | By design: they are saved per chart in `KcMidTrader.restore.txt` (in `Documents\NinjaTrader 8\bin\Custom`) and restored when the indicator reloads |
 | The order does not move | Tracking is paused (see the status line), *Track mode* is `OnBarClose`, or an EMA / MACD order is still armed (it has no broker order until its cross) |
 | Orders still working after removing the indicator | By design, a reload never cancels orders. Click **Cancel KC Orders** first |
 | ATM orders not tracked after a reload | NinjaTrader names every ATM entry "Entry", so they can't be identified; cancel them from the chart or the Orders tab |
@@ -288,7 +289,7 @@ The animated demo above is an illustration made with synthetic bars; the YouTube
 - Adding controls to Chart Trader is **not an officially supported** NinjaTrader feature. It works through the WPF visual tree, and a future NinjaTrader update could change the internal control names.
 - Tracking state lives in memory. After a reload, only non-ATM orders (named `KCMid…`) are re-adopted.
 - With unrecognized line names, the midband is taken as the middle value of the indicator's first three lines.
-- The header comment inside `KcMidTrader.cs` still says "stock Keltner Channel" and "recomputed internally"; the code now reads the plot of any visible indicator whose name contains the filter text.
+- Two lines of the header comment inside `KcMidTrader.cs` ("only shown while a visible stock Keltner Channel is on the chart" and "recomputed internally with the SAME Period / Offset multiplier") are outdated: the code now reads the plot of any visible indicator whose name contains the filter text.
 
 </details>
 

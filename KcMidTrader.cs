@@ -10,7 +10,7 @@
 //    * BUY or SELL at the selected line plus that offset with one click (Midline by default)
 //    * keep those orders ATTACHED to the offset price. Each working order keeps its own line. The Track box sets that line at first. Changing Track or Line moves only the checked not-filled orders that have not had SL / TP applied; the others stay on the line they already follow
 //    * on one checked order, filled or still working, point its stop or target at an indicator, remove either leg without closing the position, close the target on an EMA cross, or close the position when MACD falls through an absolute level. A working order gets that stop and target immediately. They follow its price until it fills, then stay on the fill. Confirming SL / TP locks that bracket. It stays there, including when Track is an EMA or any study other than the Keltner, until SL / TP is confirmed again. Each order keeps its own choice. A not-filled order changes that choice only when it is checked. One checked order is changed by itself. Two or more checked not-filled orders take the same line or value when they are set together from the Chart Trader ATM strategy or the SL / TP window
-//    * with two or more EMAs, track an EMA cross: Buy or Sell stays not filled until a later favorable cross, then the ATM stop is kept and the target waits for the next cross. EMA A starts on EMA(9) and EMA B on EMA(20) when those EMAs are on the chart. When a Keltner Channel is on the chart, EMA A or EMA B can be that Keltner, on Midline (the default), Upper, or Lower
+//    * with two or more EMAs, track an EMA cross: Buy or Sell stays not filled until a later favorable cross, then the ATM stop is kept and the target waits for the next cross. EMA A starts on EMA(9) and EMA B on EMA(20) when those EMAs are on the chart, otherwise on the other EMAs. The same defaults are used when EMA cross is selected in SL / TP. When a Keltner Channel is on the chart, EMA A or EMA B can be that Keltner from the dropdown, on Midline (the default), Upper, or Lower
 //    * MACD is a trigger, not a price. The Track window stores a magnitude. Buy waits for MACD to cross above it and Sell waits for MACD to cross below it. The order stays not filled until that cross, then a limit is sent at the Keltner midline and the selected ATM starts. SL / TP on a filled or working order uses its own magnitude (default 0, a minus sign is ignored). At 0 a buy closes when MACD crosses down through 0 and a sell closes when MACD crosses up through 0. Any other magnitude closes either side when the absolute MACD level falls through it. A cross that is already true waits until MACD leaves the level and crosses again. A working order keeps the choice and uses it once it fills
 //    * CANCEL every order this tool placed with one click
 //    * Chart Trader Buy Mkt, Sell Mkt, Buy Bid, Buy Ask, Sell Bid, and Sell Ask are listed too. Each one moves through Not filled, Filled, and Completed. The selected ATM keeps its stop and target. One checked order, filled or not filled, uses SL / TP by itself. Checked not-filled orders that are set together share that stop and target
@@ -5861,7 +5861,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             System.Windows.Controls.StackPanel root = new System.Windows.Controls.StackPanel { Margin = new Thickness(12) };
             root.Children.Add(new System.Windows.Controls.TextBlock
             {
-                Text = "Buy opens when EMA A crosses above EMA B. Sell opens when EMA A crosses below EMA B. A cross that is already true does not open or close. EMA A starts on EMA(9) and EMA B on EMA(20) when those EMAs are on the chart. When a Keltner Channel is on the chart, EMA A or EMA B can be that Keltner. The line starts on Midline.",
+                Text = "Buy opens when EMA A crosses above EMA B. Sell opens when EMA A crosses below EMA B. A cross that is already true does not open or close. EMA A starts on EMA(9) and EMA B on EMA(20) when those EMAs are on the chart, otherwise on the other EMAs. When a Keltner Channel is on the chart, choose it from the EMA A or EMA B dropdown. The line starts on Midline.",
                 TextWrapping = TextWrapping.Wrap,
                 Foreground = new SolidColorBrush(Color.FromRgb(0x3A, 0x42, 0x50)),
                 Margin = new Thickness(0, 0, 0, 8)
@@ -6506,7 +6506,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         // EMA A hides the indicator chosen in B, and EMA B hides the indicator chosen in A.
-        // A side that has no choice yet starts on EMA(9) or EMA(20) when that EMA is on the chart.
+        // A side that has no choice yet starts on EMA(9) or EMA(20), then any other EMA.
+        // A Keltner stays in the dropdown and is used only when it is selected there.
         private static void SyncExclusiveEmas(System.Windows.Controls.ComboBox emaA, System.Windows.Controls.ComboBox emaB,
                                                List<KcSource> emas,
                                                NinjaTrader.Gui.NinjaScript.IndicatorRenderBase preferA,
@@ -6531,8 +6532,38 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (unsetA && !unsetB) preferA = null;
                 else preferB = null;
             }
+            if (unsetA && (preferA == null || !IsEmaIndicator(preferA, emas)))
+                preferA = FindDefaultEma(emas, preferB);
+            if (unsetB && (preferB == null || !IsEmaIndicator(preferB, emas)))
+                preferB = FindDefaultEma(emas, preferA);
             FillEmaBox(emaA, emas, preferB, preferA);
             FillEmaBox(emaB, emas, SelectedEma(emaA), preferB);
+        }
+
+        // First unused EMA. A plain EMA is preferred. A Keltner is never the default.
+        private static NinjaTrader.Gui.NinjaScript.IndicatorRenderBase FindDefaultEma(
+            List<KcSource> lines,
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase exclude)
+        {
+            if (lines == null) return null;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase plain = null;
+            NinjaTrader.Gui.NinjaScript.IndicatorRenderBase any = null;
+            foreach (KcSource k in lines)
+            {
+                if (k == null || k.Indicator == null || !IsEma(k)) continue;
+                if (exclude != null && ReferenceEquals(k.Indicator, exclude)) continue;
+                if (any == null) any = k.Indicator;
+                if (plain == null && IsPlainEma(k)) plain = k.Indicator;
+            }
+            return plain ?? any;
+        }
+
+        private static bool IsEmaIndicator(NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind, List<KcSource> lines)
+        {
+            if (ind == null || lines == null) return false;
+            foreach (KcSource k in lines)
+                if (k != null && ReferenceEquals(k.Indicator, ind)) return IsEma(k);
+            return false;
         }
 
         // Stock EMA whose period is 9 or 20. DEMA, TEMA, and ZLEMA are left for a manual choice.
@@ -6619,17 +6650,36 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (box == null) return;
             box.Items.Clear();
-            if (emas != null)
-            {
-                foreach (KcSource k in emas)
-                {
-                    if (k == null || k.Indicator == null) continue;
-                    if (exclude != null && ReferenceEquals(k.Indicator, exclude)) continue;
-                    box.Items.Add(new FollowPick { Text = k.Label, Source = k, Kind = FollowKind.Indicator });
-                }
-            }
+            AddEmaPicks(box, emas, exclude, true);
+            AddEmaPicks(box, emas, exclude, false);
             int sel = IndexOfIndicator(box, prefer);
+            if (sel < 0) sel = IndexOfFirstEma(box);
             box.SelectedIndex = sel >= 0 ? sel : (box.Items.Count > 0 ? 0 : -1);
+        }
+
+        // EMAs are listed first. A Keltner is added after them, so it is chosen from the dropdown.
+        private static void AddEmaPicks(System.Windows.Controls.ComboBox box, List<KcSource> emas,
+                                         NinjaTrader.Gui.NinjaScript.IndicatorRenderBase exclude, bool emaOnly)
+        {
+            if (box == null || emas == null) return;
+            foreach (KcSource k in emas)
+            {
+                if (k == null || k.Indicator == null) continue;
+                if (exclude != null && ReferenceEquals(k.Indicator, exclude)) continue;
+                if (IsEma(k) != emaOnly) continue;
+                box.Items.Add(new FollowPick { Text = k.Label, Source = k, Kind = FollowKind.Indicator });
+            }
+        }
+
+        private static int IndexOfFirstEma(System.Windows.Controls.ComboBox box)
+        {
+            if (box == null) return -1;
+            for (int i = 0; i < box.Items.Count; i++)
+            {
+                FollowPick pick = box.Items[i] as FollowPick;
+                if (pick != null && IsEma(pick.Source)) return i;
+            }
+            return -1;
         }
 
         private static int IndexOfIndicator(System.Windows.Controls.ComboBox box, NinjaTrader.Gui.NinjaScript.IndicatorRenderBase ind)
